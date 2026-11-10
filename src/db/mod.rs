@@ -85,6 +85,25 @@ mod tests {
         // Simulate the old history: 20 rows, wrong checksums, last one present,
         // and no api_keys table yet.
         sqlx::query("DROP TABLE api_keys").execute(&pool).await.unwrap();
+        sqlx::query("DROP TABLE coach_note").execute(&pool).await.unwrap();
+        sqlx::query("DROP TABLE checkins").execute(&pool).await.unwrap();
+        sqlx::query("DROP TABLE availability_defaults").execute(&pool).await.unwrap();
+        for t in ["mcp_audit", "oauth_settings", "oauth_clients", "oauth_codes", "oauth_access_tokens", "oauth_refresh_tokens", "oauth_failures"] {
+            sqlx::query(&format!("DROP TABLE {t}")).execute(&pool).await.unwrap();
+        }
+        sqlx::query("DROP TABLE availability_exceptions").execute(&pool).await.unwrap();
+        sqlx::query("DROP INDEX idx_planned_idempotency").execute(&pool).await.unwrap();
+        for col in ["max_ctl_ramp_per_week", "min_tsb", "intense_if", "intense_tss", "max_consecutive_intense", "min_rest_days_per_week"] {
+            sqlx::query(&format!("ALTER TABLE athlete_config DROP COLUMN {col}")).execute(&pool).await.unwrap();
+        }
+        for col in ["status", "rationale", "idempotency_key", "kind", "budget_tss_min", "budget_tss_max", "budget_duration_max_min", "intent", "activity_id"] {
+            sqlx::query(&format!("ALTER TABLE planned_workouts DROP COLUMN {col}")).execute(&pool).await.unwrap();
+        }
+        sqlx::query("DROP INDEX idx_workouts_group").execute(&pool).await.unwrap();
+        sqlx::query("DROP INDEX idx_workouts_external_id").execute(&pool).await.unwrap();
+        for col in ["category", "group_name", "description", "source_url", "external_id", "group_key", "subgroup", "position"] {
+            sqlx::query(&format!("ALTER TABLE workouts DROP COLUMN {col}")).execute(&pool).await.unwrap();
+        }
         sqlx::query("DELETE FROM _sqlx_migrations").execute(&pool).await.unwrap();
         for i in 0..19i64 {
             sqlx::query(
@@ -106,7 +125,7 @@ mod tests {
 
         migrate(&pool).await.unwrap();
         let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM _sqlx_migrations").fetch_one(&pool).await.unwrap();
-        assert_eq!(n, 2); // initial (adopted) + api_keys (applied after)
+        assert_eq!(n, 10); // initial (adopted) + the nine later migrations (applied after)
         migrate(&pool).await.unwrap(); // idempotent
     }
 

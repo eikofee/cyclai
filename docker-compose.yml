@@ -5,7 +5,7 @@
 #                 (ex. `tailscale serve --bg 3000`), jamais en funnel.
 #  - cyclai-api : API JSON seule, chaque requête exige un JWT RS256 signé par
 #                 une clé enregistrée (`cyclai api-key add`). C'est elle qu'on
-#                 peut exposer (ex. `tailscale funnel --bg 3001`).
+#                 peut exposer (Funnel sur le port 8443, voir deploy/tailscale-serve.json).
 services:
   cyclai-ui:
     image: cyclai
@@ -26,6 +26,10 @@ services:
       - cyclai-ui
     ports:
       - "3001:3001"
+    environment:
+      # URL publique de l'API (Funnel), ex. https://machine.tailnet.ts.net:8443 —
+      # annoncée dans les métadonnées OAuth du connecteur MCP.
+      - PUBLIC_BASE_URL=${PUBLIC_BASE_URL:-}
     volumes:
       - cyclai-data:/data
 

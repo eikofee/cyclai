@@ -1,14 +1,19 @@
 mod apikeys;
+mod availability;
 mod bests;
 mod config;
 mod db;
 mod digest;
+mod envelope;
+mod garmin;
 mod importer;
 mod llm;
 mod metrics;
+mod oauth;
 mod performance;
 mod planned;
 mod report;
+mod rules;
 mod route_profile;
 mod route_thumb;
 mod segments;
@@ -17,6 +22,7 @@ mod strava;
 mod sync;
 mod web;
 mod workout;
+mod zwift;
 mod zwo;
 
 use clap::{Parser, Subcommand};
@@ -55,6 +61,9 @@ enum Command {
     /// Manage the public keys allowed to call the API.
     #[command(subcommand)]
     ApiKey(ApiKeyCommand),
+    /// Manage the OAuth access of MCP connectors (Claude web/mobile).
+    #[command(subcommand)]
+    Oauth(OauthCommand),
     /// One-time (or re-run as needed) import of starred Strava segments'
     /// coordinates into reference_segments. Starring itself is manual.
     ImportSegments,
@@ -85,6 +94,69 @@ enum ApiKeyCommand {
         #[arg(long, default_value_t = 60)]
         ttl: i64,
     },
+}
+
+#[derive(Subcommand)]
+enum OauthCommand {
+    /// Set the password asked on the consent page (read from stdin, one line).
+    SetPassword,
+    /// List the registered connectors.
+    List,
+    /// Revoke a connector by client id, or `all` (its tokens stop working at once).
+    Revoke { client_id: String },
+    /// Days of inactivity after which a connector must be authorized again.
+    SetRefreshDays { days: i64 },
+}
+
+async fn oauth_command(pool: &sqlx::SqlitePool, cmd: OauthCommand) -> anyhow::Result<()> {
+    use std::io::{BufRead, IsTerminal, Write};
+    match cmd {
+        OauthCommand::SetPassword => {
+            let interactive = std::io::stdin().is_terminal();
+            let mut read = |prompt: &str| -> anyhow::Result<String> {
+                if interactive {
+                    eprint!("{prompt}");
+                    std::io::stderr().flush()?;
+                }
+                let mut line = String::new();
+                std::io::stdin().lock().read_line(&mut line)?;
+                Ok(line.trim_end_matches(['\r', '\n']).to_string())
+            };
+            let password = read("New password (visible as you type, min 12 characters): ")?;
+            if interactive && read("Again: ")? != password {
+                anyhow::bail!("the two entries differ");
+            }
+            oauth::set_password(pool, &password).await?;
+            println!("password set");
+        }
+        OauthCommand::List => {
+            for c in oauth::list(pool).await? {
+                println!(
+                    "{}	{}	created {}	last used {}	{}",
+                    c.id,
+                    c.name.as_deref().unwrap_or("-"),
+                    c.created_at,
+                    c.last_used_at.as_deref().unwrap_or("never"),
+                    if c.revoked { "revoked" } else { "active" },
+                );
+            }
+        }
+        OauthCommand::Revoke { client_id } => {
+            let n = oauth::revoke(pool, &client_id).await?;
+            if n == 0 {
+                anyhow::bail!("no active connector '{client_id}'");
+            }
+            println!("{n} connector(s) revoked");
+        }
+        OauthCommand::SetRefreshDays { days } => {
+            if !(1..=3650).contains(&days) {
+                anyhow::bail!("days must be between 1 and 3650");
+            }
+            sqlx::query("UPDATE oauth_settings SET refresh_days = ? WHERE id = 1").bind(days).execute(pool).await?;
+            println!("connectors must re-authorize after {days} days of inactivity (applies to tokens issued from now on)");
+        }
+    }
+    Ok(())
 }
 
 async fn api_key_command(pool: &sqlx::SqlitePool, cmd: ApiKeyCommand) -> anyhow::Result<()> {
@@ -131,6 +203,7 @@ async fn main() -> anyhow::Result<()> {
     db::seed_athlete_config(&pool, &config).await?;
     db::seed_settings(&pool, &config).await?;
     db::seed_sync_state(&pool, &config).await?;
+    zwift::seed(&pool).await?;
 
     match cli.command {
         Command::Sync { full } => {
@@ -148,6 +221,9 @@ async fn main() -> anyhow::Result<()> {
         }
         Command::ApiKey(cmd) => {
             api_key_command(&pool, cmd).await?;
+        }
+        Command::Oauth(cmd) => {
+            oauth_command(&pool, cmd).await?;
         }
         Command::ImportSegments => {
             segments::import_starred(&pool).await?;

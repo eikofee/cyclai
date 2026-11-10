@@ -23,13 +23,15 @@ Le sync n'est **pas** un planificateur embarqué : c'est une sous-commande CLI (
 
 ```
 src/
-  main.rs            CLI (clap) : serve | sync [--full] | import-segments ; amorçage de la base
+  main.rs            CLI (clap) : serve | serve-api | sync [--full] | import-segments | api-key | oauth ; amorçage de la base
   config.rs          variables d'environnement d'amorçage (lues une fois)
   settings.rs        réglages en base : clés, profil, prompts (table settings)
   db/                connexion sqlx, migrations, seeds, rattrapage des miniatures
 
   strava/            client API : OAuth (refresh rotatif), activités, streams, laps, segments favoris
   sync.rs            orchestration du sync (normal et --full)
+  zwift.rs           catalogue « Depuis Zwift » : plans et collections vélo > semaines/sous-groupes (data/zwift_plans.json, généré par tools/scrape_zwift.py), importé au démarrage
+  garmin.rs          export d'une séance en .fit Garmin (rampes -> plages de puissance, % FTP ou watts)
   importer.rs        parseurs FIT (fitparser) et GPX (gpx) -> même forme que le sync Strava
 
   metrics/           TSS/IF, hrTSS, zones puissance, CTL/ATL/TSB, résumé dashboard
@@ -40,7 +42,12 @@ src/
   route_profile.rs   profil d'altitude / pente d'un GPX d'itinéraire
 
   workout.rs         modèle Workout (étapes, cibles), durées, TSS / distance estimés
-  planned.rs         séances planifiées : validation et stockage
+  planned.rs         séances planifiées : statuts, validation, stockage, séances « free ride », rapprochement automatique avec les sorties
+  rules.rs           règles dures (rampe de CTL, plancher de TSB, jours intenses, repos) et simulation de la charge future
+  availability.rs    disponibilités : défauts par jour de semaine + exceptions par date
+  envelope.rs        enveloppes de sortie : scénarios, fourchettes de TSS apprises de l'historique
+  apikeys.rs         clés publiques RS256 des clients de l'API (JWT signés côté client)
+  oauth.rs           serveur d'autorisation OAuth 2.1 du connecteur MCP : clients, codes PKCE, jetons hachés, rotation
 
   llm/               trait LlmClient, client Anthropic, prompt du bilan
   digest.rs          prompt et parsing du digest, distance estimée
@@ -58,6 +65,9 @@ src/
     stats.rs         page /stats (totaux, carte des traces, records, radar)
     import.rs        upload FIT / GPX
     api.rs           API JSON /api/v1
+    auth.rs          garde JWT du processus API
+    mcp.rs           serveur MCP (/mcp) : outils = adaptateurs en processus des routes /api/v1, scopes, audit, limites
+    oauth.rs         endpoints OAuth : métadonnées, enregistrement, consentement (mot de passe), jetons
     format.rs        dates en français (Europe/Paris), durées, allures
 ```
 
@@ -86,13 +96,19 @@ Les migrations de `migrations/` sont embarquées dans le binaire et appliquées 
 | `activity_bilans` | Texte du bilan LLM par activité |
 | `digests` | Note libre, résumé envoyé, réponse JSON et texte |
 | `workouts` | Modèles de séances (`steps_json`, `sport`, `source` = `manual` \| `digest`) |
-| `planned_workouts` | Séances planifiées : copie des étapes, date, `sport`, `workout_id` informatif, `source` = `manual` \| `api` |
+| `planned_workouts` | Séances planifiées : copie des étapes, date, `sport`, `workout_id` informatif, `source` = `manual` \| `api`, `status` (`planned` \| `proposed` \| `confirmed` \| `done` \| `skipped` \| `rejected`), `kind` (`workout` \| `free_ride`) et budget des sorties libres |
 | `activity_bests` | Records par activité : `power` (durée en s → W) et `dist` (distance en m → meilleur temps en s) |
 | `daily_load` | TSS, CTL, ATL, TSB par jour, de la première activité à aujourd'hui |
 | `dashboard_summary` | Cache d'une ligne pour la carte « 4 dernières semaines » |
 | `athlete_config` | FTP, FC max / repos / seuil, coefficient hrTSS, allure seuil de course |
 | `settings` | Clés Strava / Anthropic, profil cycliste, deux prompts système |
 | `sync_state` | Date du dernier sync, refresh token Strava (rotatif) |
+| `coach_note`, `checkins` | Message du dashboard ; ressenti quotidien |
+| `training_rules` | Règles dures ajustables dans /settings |
+| `availability_defaults`, `availability_exceptions` | Temps disponible par jour de semaine / par date |
+| `api_keys` | Clés publiques autorisées à appeler l'API |
+| `mcp_audit` | Journal des appels d'outils MCP |
+| `oauth_*` | Mot de passe de consentement, clients, codes, jetons d'accès et de rafraîchissement (hachés), échecs de connexion |
 
 `steps_json` est volontairement du JSON non normalisé : un arbre d'étapes avec répétitions imbriquées s'adapte mal à des tables.
 

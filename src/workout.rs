@@ -59,6 +59,11 @@ pub enum Target {
     HrZone { zone: u8 },
     /// One of the 7 power zones (% of FTP, see `POWER_ZONE_RANGES_FRAC`).
     PowerZone { zone: u8 },
+    /// Steady power as a percentage of FTP (`low == high` for a single value).
+    /// Follows the FTP set in the app, unlike `PowerRange`'s fixed watts.
+    FtpPctRange { low: f64, high: f64 },
+    /// Linear ramp in % of FTP from `from` to `to` (descending when `to < from`).
+    FtpRamp { from: f64, to: f64 },
     /// Running pace range in seconds per km; `low` is the *faster* end
     /// (smaller number). Read from a number or an "m:ss" string.
     PaceRange {
@@ -153,6 +158,15 @@ impl Workout {
         steps_load(&self.steps, a)
     }
 
+    /// Minutes spent in each of the 7 power zones (index 0 = Z1) at the
+    /// athlete's current FTP. Ramps are sliced so they spread over the zones
+    /// they cross; steps without a target count at 60 % FTP like `load_estimate`.
+    pub fn zone_minutes(&self, a: &Athlete) -> [f64; 7] {
+        let mut zones = [0.0; 7];
+        add_zone_minutes(&self.steps, a, 1.0, &mut zones);
+        zones
+    }
+
     /// Minimal sanity checks — not a full training-science validator.
     /// Duration strings that fail to parse come back as 0 minutes, so 0 is
     /// treated as "didn't parse". Returns a user-facing (French) message.
@@ -201,6 +215,46 @@ fn steps_run_distance_km(steps: &[WorkoutStep], a: &Athlete) -> Option<f64> {
     Some(total)
 }
 
+/// Zone (0-based) of an intensity expressed as a fraction of FTP — same
+/// bounds as `metrics::power_zone`.
+pub fn zone_index(frac: f64) -> usize {
+    crate::metrics::power_zone(frac, 1.0) - 1
+}
+
+/// Intensity factor of a whole session from its duration and TSS estimate.
+pub fn intensity_factor(minutes: f64, tss: f64) -> f64 {
+    if minutes <= 0.0 {
+        0.0
+    } else {
+        (tss / (minutes / 60.0 * 100.0)).max(0.0).sqrt()
+    }
+}
+
+fn add_zone_minutes(steps: &[WorkoutStep], a: &Athlete, times: f64, zones: &mut [f64; 7]) {
+    for step in steps {
+        match step {
+            WorkoutStep::Repeat { count, steps } => add_zone_minutes(steps, a, times * *count as f64, zones),
+            WorkoutStep::Warmup(s) | WorkoutStep::Interval(s) | WorkoutStep::Recovery(s) | WorkoutStep::Cooldown(s) => {
+                let m = s.duration.minutes() * times;
+                match &s.target {
+                    Some(Target::FtpRamp { from, to }) => {
+                        const SLICES: usize = 10;
+                        for i in 0..SLICES {
+                            let t = (i as f64 + 0.5) / SLICES as f64;
+                            let frac = (from + (to - from) * t) / 100.0;
+                            zones[zone_index(frac)] += m / SLICES as f64;
+                        }
+                    }
+                    t => {
+                        let frac = t.as_ref().map(|t| t.power_frac(a)).unwrap_or(0.6);
+                        zones[zone_index(frac)] += m;
+                    }
+                }
+            }
+        }
+    }
+}
+
 fn steps_load(steps: &[WorkoutStep], a: &Athlete) -> (f64, f64) {
     let mut minutes = 0.0;
     let mut tss = 0.0;
@@ -244,6 +298,12 @@ fn check_steps(steps: &[WorkoutStep]) -> Option<String> {
                 match &s.target {
                     Some(Target::PowerRange { low, high }) if low > high => {
                         return Some("La cible de puissance basse doit être inférieure ou égale à la haute.".to_string());
+                    }
+                    Some(Target::FtpPctRange { low, high }) if *low <= 0.0 || low > high => {
+                        return Some("La cible en % FTP doit être positive, basse ≤ haute.".to_string());
+                    }
+                    Some(Target::FtpRamp { from, to }) if *from <= 0.0 || *to <= 0.0 => {
+                        return Some("Les extrémités d'une rampe en % FTP doivent être positives.".to_string());
                     }
                     Some(Target::HrRange { low, high }) => {
                         if *low <= 0.0 || low > high {
@@ -346,6 +406,8 @@ impl Target {
                 }
             }
             Target::PowerRange { low, high } => (low + high) / 2.0 / a.ftp_watts,
+            Target::FtpPctRange { low, high } => (low + high) / 200.0,
+            Target::FtpRamp { from, to } => (from + to) / 200.0,
             Target::HrZone { zone } => HR_ZONE_POWER_FRAC[(*zone).clamp(1, 5) as usize - 1],
             Target::HrRange { low, high } => {
                 HR_ZONE_POWER_FRAC[hr_zone_of((low + high) / 2.0, a) as usize - 1]

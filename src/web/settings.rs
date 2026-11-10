@@ -49,6 +49,7 @@ async fn render_page(pool: &sqlx::SqlitePool, error: Option<&str>) -> Html<Strin
             .flatten()
             .flatten();
 
+    let rules = crate::rules::Rules::load(pool).await.unwrap_or_default();
     let (ftp_watts, hr_max, hr_rest, lthr, hr_tss_coef, run_pace_s): (i64, i64, i64, i64, f64, i64) = sqlx::query_as(
         "SELECT ftp_watts, hr_max, hr_rest, lthr, hr_tss_coef, run_threshold_pace_s FROM athlete_config WHERE id = 1",
     )
@@ -60,6 +61,44 @@ async fn render_page(pool: &sqlx::SqlitePool, error: Option<&str>) -> Html<Strin
     let error_html = error
         .map(|e| format!(r#"<p class="form-error">{}</p>"#, escape_html(e)))
         .unwrap_or_default();
+
+    let slots = crate::availability::defaults(pool).await.unwrap_or_default();
+    let availability_rows: String = slots
+        .iter()
+        .enumerate()
+        .map(|(i, s)| {
+            format!(
+                r#"  <div class="avail-row"><strong>{day}</strong>
+    <input type="number" name="min_{i}" value="{min}" min="0" max="720" aria-label="Minutes {day}"> min
+    <select name="tod_{i}">{tod}</select>
+    <select name="ctx_{i}">{ctx}</select></div>
+"#,
+                day = crate::availability::WEEKDAYS[i],
+                min = s.available_min,
+                tod = select_options(&crate::availability::TIMES_OF_DAY, &s.time_of_day),
+                ctx = select_options(&crate::availability::CONTEXTS, &s.context),
+            )
+        })
+        .collect();
+    let today = chrono::Utc::now().date_naive();
+    let exceptions = crate::availability::exceptions_from(pool, today).await.unwrap_or_default();
+    let availability_exceptions = if exceptions.is_empty() {
+        r#"<p class="hint">Aucune exception à venir.</p>"#.to_string()
+    } else {
+        exceptions
+            .iter()
+            .map(|(date, s, note)| {
+                format!(
+                    r#"<form method="post" action="/settings/availability/delete" class="avail-row">{date} : {min} min, {tod}, {ctx}{note} <input type="hidden" name="date" value="{date}"><button type="submit" class="secondary">Supprimer</button></form>"#,
+                    date = escape_html(date),
+                    min = s.available_min,
+                    tod = escape_html(&s.time_of_day),
+                    ctx = escape_html(&s.context),
+                    note = note.as_deref().map(|n| format!(" — {}", escape_html(n))).unwrap_or_default(),
+                )
+            })
+            .collect()
+    };
 
     let body = format!(
         r#"{error_html}
@@ -136,6 +175,61 @@ document.querySelectorAll('.swatch').forEach(function(b) {{
 </section>
 
 <section>
+<h2>Règles d'entraînement</h2>
+<p class="hint">Appliquées par le serveur aux séances proposées et aux simulations de charge (l'agent ne peut pas les contourner). Un jour est « intense » si son IF atteint le seuil ou si son TSS atteint le TSS minimum.</p>
+<form method="post" action="/settings/rules">
+  <label>Gain de CTL maximal sur 7 jours
+  <input type="number" name="max_ctl_ramp_per_week" value="{max_ctl_ramp}" min="0" step="0.5">
+  </label>
+  <label>Plancher de TSB
+  <input type="number" name="min_tsb" value="{min_tsb}" min="-100" max="0" step="1">
+  </label>
+  <label>Jour intense : IF à partir de
+  <input type="number" name="intense_if" value="{intense_if}" min="0.5" max="1.5" step="0.01">
+  </label>
+  <label>Jour intense : TSS du jour à partir de
+  <input type="number" name="intense_tss" value="{intense_tss}" min="1" step="1">
+  </label>
+  <label>Jours intenses consécutifs maximum
+  <input type="number" name="max_consecutive_intense" value="{max_consec}" min="1" max="7">
+  </label>
+  <label>Jours de repos minimum par fenêtre de 7 jours
+  <input type="number" name="min_rest_days_per_week" value="{min_rest}" min="0" max="7">
+  </label>
+  <button type="submit">Enregistrer</button>
+</form>
+</section>
+
+<section>
+<h2>Disponibilités</h2>
+<p class="hint">Temps disponible pour rouler, par jour de la semaine. L'agent s'en sert pour dimensionner les séances ; il peut poser des exceptions (vacances, soirées longues), jamais modifier ces règles.</p>
+<form method="post" action="/settings/availability">
+{availability_rows}
+  <button type="submit">Enregistrer</button>
+</form>
+<h3>Exceptions à venir</h3>
+{availability_exceptions}
+<form method="post" action="/settings/availability/exception">
+  <label>Date
+  <input type="date" name="date" required>
+  </label>
+  <label>Minutes disponibles
+  <input type="number" name="available_min" value="120" min="0" max="720" required>
+  </label>
+  <label>Moment
+  <select name="time_of_day">{tod_options}</select>
+  </label>
+  <label>Contexte
+  <select name="context">{ctx_options}</select>
+  </label>
+  <label>Note
+  <input type="text" name="note" maxlength="300">
+  </label>
+  <button type="submit">Ajouter ou remplacer l'exception</button>
+</form>
+</section>
+
+<section>
 <h2>Profil cycliste</h2>
 <p class="hint">Réinjecté dans chaque prompt envoyé au LLM (bilans et digest hebdomadaire) : FTP/zones, objectifs, équipement, contraintes...</p>
 <form method="post" action="/settings/profile">
@@ -181,6 +275,16 @@ document.querySelectorAll('.swatch').forEach(function(b) {{
         hr_rest = hr_rest,
         lthr = lthr,
         hr_tss_coef = hr_tss_coef,
+        availability_rows = availability_rows,
+        availability_exceptions = availability_exceptions,
+        tod_options = select_options(&crate::availability::TIMES_OF_DAY, "soir"),
+        ctx_options = select_options(&crate::availability::CONTEXTS, "autre"),
+        max_ctl_ramp = rules.max_ctl_ramp_per_week,
+        min_tsb = rules.min_tsb,
+        intense_if = rules.intense_if,
+        intense_tss = rules.intense_tss,
+        max_consec = rules.max_consecutive_intense,
+        min_rest = rules.min_rest_days_per_week,
         run_pace = run_pace,
         strava_client_id = escape_html(&settings.strava_client_id),
         strava_client_secret = escape_html(&settings.strava_client_secret),
@@ -276,6 +380,88 @@ pub async fn update_athlete_config(
 
     let _ = crate::metrics::run(&state.pool).await;
 
+    Redirect::to("/settings")
+}
+
+#[derive(Deserialize)]
+pub struct RulesForm {
+    max_ctl_ramp_per_week: f64,
+    min_tsb: f64,
+    intense_if: f64,
+    intense_tss: f64,
+    max_consecutive_intense: i64,
+    min_rest_days_per_week: i64,
+}
+
+pub async fn update_rules(State(state): State<AppState>, axum::extract::Form(f): axum::extract::Form<RulesForm>) -> Redirect {
+    let d = crate::rules::Rules::default();
+    let finite = |v: f64, lo: f64, hi: f64, default: f64| if v.is_finite() { v.clamp(lo, hi) } else { default };
+    let _ = sqlx::query(
+        "UPDATE athlete_config SET max_ctl_ramp_per_week = ?, min_tsb = ?, intense_if = ?, intense_tss = ?,          max_consecutive_intense = ?, min_rest_days_per_week = ?, updated_at = datetime('now') WHERE id = 1",
+    )
+    .bind(finite(f.max_ctl_ramp_per_week, 0.0, 50.0, d.max_ctl_ramp_per_week))
+    .bind(finite(f.min_tsb, -100.0, 0.0, d.min_tsb))
+    .bind(finite(f.intense_if, 0.5, 1.5, d.intense_if))
+    .bind(finite(f.intense_tss, 1.0, 1000.0, d.intense_tss))
+    .bind(f.max_consecutive_intense.clamp(1, 7))
+    .bind(f.min_rest_days_per_week.clamp(0, 7))
+    .execute(&state.pool)
+    .await;
+    Redirect::to("/settings")
+}
+
+fn select_options(values: &[&str], selected: &str) -> String {
+    values
+        .iter()
+        .map(|v| format!(r#"<option value="{v}"{}>{v}</option>"#, if *v == selected { " selected" } else { "" }))
+        .collect()
+}
+
+/// Weekday defaults: fields `min_0`…`min_6`, `tod_0`…, `ctx_0`… (Monday = 0).
+/// Rows that don't validate keep their current value.
+pub async fn update_availability(State(state): State<AppState>, axum::extract::Form(fields): axum::extract::Form<Vec<(String, String)>>) -> Redirect {
+    let get = |k: String| fields.iter().find(|(n, _)| *n == k).map(|(_, v)| v.as_str());
+    let mut slots = crate::availability::defaults(&state.pool).await.unwrap_or_default();
+    for (i, slot) in slots.iter_mut().enumerate() {
+        let candidate = crate::availability::Slot {
+            available_min: get(format!("min_{i}")).and_then(|v| v.trim().parse().ok()).unwrap_or(slot.available_min),
+            time_of_day: get(format!("tod_{i}")).unwrap_or(&slot.time_of_day).to_string(),
+            context: get(format!("ctx_{i}")).unwrap_or(&slot.context).to_string(),
+        };
+        if crate::availability::validate(&candidate).is_ok() {
+            *slot = candidate;
+        }
+    }
+    let _ = crate::availability::save_defaults(&state.pool, &slots).await;
+    Redirect::to("/settings")
+}
+
+#[derive(Deserialize)]
+pub struct AvailabilityExceptionForm {
+    date: String,
+    available_min: i64,
+    time_of_day: String,
+    context: String,
+    #[serde(default)]
+    note: String,
+}
+
+pub async fn add_availability_exception(State(state): State<AppState>, axum::extract::Form(f): axum::extract::Form<AvailabilityExceptionForm>) -> Redirect {
+    let slot = crate::availability::Slot { available_min: f.available_min, time_of_day: f.time_of_day, context: f.context };
+    if let (Some(date), Ok(())) = (crate::planned::parse_date(&f.date), crate::availability::validate(&slot)) {
+        let note: String = f.note.trim().chars().take(300).collect();
+        let _ = crate::availability::set_exception(&state.pool, date, &slot, Some(note.as_str()).filter(|n| !n.is_empty())).await;
+    }
+    Redirect::to("/settings")
+}
+
+#[derive(Deserialize)]
+pub struct DateForm {
+    date: String,
+}
+
+pub async fn delete_availability_exception(State(state): State<AppState>, axum::extract::Form(f): axum::extract::Form<DateForm>) -> Redirect {
+    let _ = crate::availability::delete_exception(&state.pool, f.date.trim()).await;
     Redirect::to("/settings")
 }
 

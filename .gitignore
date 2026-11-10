@@ -7,3 +7,4 @@
 cyclai.tar
 .claude/scheduled_tasks.lock
 update.ps1
+__pycache__/

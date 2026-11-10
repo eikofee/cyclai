@@ -112,6 +112,19 @@ pub(super) const CHART_JS: &str = r####"<script>
       var txt = Math.round(l) + (h !== l ? '–' + Math.round(h) : '');
       return {kind: 'hr', lo: HR_FRAC[zl - 1] * ftp, hi: HR_FRAC[zh - 1] * ftp, label: txt + ' bpm', detail: txt + ' bpm'};
     }
+    if (t === 'ftp_pct_range') {
+      var pl = num(target.low), ph = Math.max(pl, num(target.high));
+      var pw = Math.round(pl / 100 * ftp) + (ph !== pl ? '–' + Math.round(ph / 100 * ftp) : '');
+      return {kind: 'power', lo: pl / 100 * ftp, hi: ph / 100 * ftp, label: null,
+              detail: pl + (ph !== pl ? '–' + ph : '') + ' % FTP (' + pw + ' W)'};
+    }
+    if (t === 'ftp_ramp') {
+      // A ramp is drawn as a slope from its start to its end (b.ramp).
+      var from = num(target.from), to = num(target.to);
+      return {kind: 'power', lo: Math.min(from, to) / 100 * ftp, hi: Math.max(from, to) / 100 * ftp,
+              ramp: [from / 100 * ftp, to / 100 * ftp], label: Math.round(from / 100 * ftp) + '→' + Math.round(to / 100 * ftp),
+              detail: 'Rampe ' + from + ' → ' + to + ' % FTP (' + Math.round(from / 100 * ftp) + ' → ' + Math.round(to / 100 * ftp) + ' W)'};
+    }
     var lo = num(target && target.low), hi = num(target && target.high);
     if (hi < lo) hi = lo;
     return {kind: 'power', lo: lo, hi: hi, label: null, detail: null};
@@ -139,7 +152,7 @@ pub(super) const CHART_JS: &str = r####"<script>
       var d = parseMinutes(s.duration && s.duration.value);
       if (d <= 0) return;
       var it = leafIntensity(s.target, ftp, hr);
-      out.push({type: s.type, start: t, dur: d, low: it.lo, high: it.hi, kind: it.kind, label: it.label, detail: it.detail});
+      out.push({type: s.type, start: t, dur: d, low: it.lo, high: it.hi, ramp: it.ramp, kind: it.kind, label: it.label, detail: it.detail});
       t += d;
     });
     return t;
@@ -224,12 +237,17 @@ pub(super) const CHART_JS: &str = r####"<script>
           : (b.low === b.high ? Math.round(b.low) : Math.round(b.low) + '–' + Math.round(b.high)) + ' W (' + Math.round(avg / ftp * 100) + ' % FTP)');
       // Solid up to the low target, translucent up to the high one; heart-rate
       // targets get a dashed outline.
-      svg += '<g><title>' + esc(tip) + '</title>' +
-        '<rect x="' + x0 + '" y="' + y(b.high) + '" width="' + bw + '" height="' + (y(0) - y(b.high)) +
-        '" fill="' + color + '" fill-opacity="0.35"/>' +
-        '<rect x="' + x0 + '" y="' + y(b.low) + '" width="' + bw + '" height="' + (y(0) - y(b.low)) +
-        '" fill="' + color + '" style="stroke:' + (isHr ? 'var(--text)' : 'var(--card-bg)') + '" stroke-width="1"' +
-        (isHr ? ' stroke-dasharray="3 2"' : '') + '/>';
+      svg += '<g><title>' + esc(tip) + '</title>';
+      if (b.ramp) {
+        svg += '<polygon points="' + x0 + ',' + y(0) + ' ' + x0 + ',' + y(b.ramp[0]) + ' ' + (x0 + bw) + ',' + y(b.ramp[1]) +
+          ' ' + (x0 + bw) + ',' + y(0) + '" fill="' + color + '" style="stroke:var(--card-bg)" stroke-width="1"/>';
+      } else {
+        svg += '<rect x="' + x0 + '" y="' + y(b.high) + '" width="' + bw + '" height="' + (y(0) - y(b.high)) +
+          '" fill="' + color + '" fill-opacity="0.35"/>' +
+          '<rect x="' + x0 + '" y="' + y(b.low) + '" width="' + bw + '" height="' + (y(0) - y(b.low)) +
+          '" fill="' + color + '" style="stroke:' + (isHr ? 'var(--text)' : 'var(--card-bg)') + '" stroke-width="1"' +
+          (isHr ? ' stroke-dasharray="3 2"' : '') + '/>';
+      }
       var label = b.label ? b.label : String(Math.round(avg));
       if (bw >= (b.label && b.label.length > 4 ? 46 : 30) && y(0) - y(b.low) >= 16) {
         svg += '<text class="wc-label" x="' + (x0 + bw / 2) + '" y="' + (y(b.low) + 12) +

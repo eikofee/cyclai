@@ -10,6 +10,8 @@ RUN mkdir src && echo "fn main() {}" > src/main.rs \
 COPY src ./src
 COPY assets ./assets
 COPY migrations ./migrations
+# Catalogue Zwift embarqué (include_str! dans src/zwift.rs).
+COPY data ./data
 # sqlx::migrate! embeds migration files at compile time, so touch main.rs to
 # force a rebuild past the dummy binary cached above.
 RUN touch src/main.rs && cargo build --release

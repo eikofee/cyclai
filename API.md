@@ -2,10 +2,12 @@
 
 API JSON sous `/api/v1`, servie par un processus dédié : `cyclai serve-api` (port 3001 par défaut). Le dashboard (`cyclai serve`) ne sert **pas** l'API ; voir [Authentification](#authentification).
 
-- Tout est en lecture seule, sauf la planification de séances (`POST` / `DELETE` sur `/planned`).
+- Tout est en lecture seule, sauf la planification de séances (`POST` / `DELETE` sur `/planned`) et la note du coach (`PUT /coach-note`).
 - Réponses en JSON ; les erreurs ont la forme `{"error": "message"}` avec le code HTTP adapté (400, 401, 403, 404, 500).
 - Dates au format `YYYY-MM-DD` ; `started_at` en ISO 8601 UTC.
 - Unités : distances en km, durées en secondes (`duration_s`) ou minutes (`duration_min`), puissances en W, FC en bpm, dénivelé en m.
+
+> Le même moteur est exposé aux agents via **MCP** (connecteur Claude, OAuth) : voir [`docs/MCP.md`](docs/MCP.md).
 
 ## Authentification
 
@@ -50,6 +52,8 @@ token = jwt.encode({"iat": now, "exp": now + 60}, open("cyclai.key").read(),
 
 Les jetons ne sont pas à usage unique : sers l'API en HTTPS (ex. Tailscale Funnel) pour qu'un jeton ne puisse pas être rejoué par un tiers pendant sa courte validité.
 
+Exposition avec Tailscale : [`deploy/tailscale-serve.json`](deploy/tailscale-serve.json) garde le dashboard privé sur `https://<machine>.<tailnet>.ts.net` (port 443, `AllowFunnel` à `false`) et publie l'API seule sur `https://<machine>.<tailnet>.ts.net:8443` (Funnel n'autorise que 443, 8443 et 10000). Le proxy cible `127.0.0.1:3001` : adapte-le au nom du conteneur (`cyclai-api:3001`) si Tailscale n'est pas dans le même espace réseau.
+
 | Méthode | Chemin | Rôle |
 |---|---|---|
 | GET | [`/api/v1/profile`](#get-apiv1profile) | FTP, FC, zones, charge actuelle |
@@ -58,7 +62,18 @@ Les jetons ne sont pas à usage unique : sers l'API en HTTPS (ex. Tailscale Funn
 | GET | [`/api/v1/activities/{id}`](#get-apiv1activitiesid) | Détail d'une sortie : laps détaillés, performances |
 | GET | [`/api/v1/activities/{id}/streams`](#get-apiv1activitiesidstreams) | Séries temporelles (puissance, FC, allure…) |
 | GET | [`/api/v1/summary`](#get-apiv1summary) | Synthèse des sorties récentes |
-| GET | [`/api/v1/workouts`](#get-apiv1workouts) | Modèles de séance |
+| GET | [`/api/v1/workouts`](#get-apiv1workouts) | Modèles de séance et catalogue (Zwift…), filtrables |
+| GET | [`/api/v1/workouts/{id}`](#get-apiv1workoutsid) | Un modèle avec toutes ses étapes |
+| GET | [`/api/v1/workouts/categories`](#get-apiv1workoutscategories) | Sommaire du catalogue : catégories, plans, effectifs |
+| POST | [`/api/v1/proposals`](#post-apiv1proposals) | Suggérer une séance (à valider dans le dashboard) |
+| POST | [`/api/v1/planned/{id}/skip`](#post-apiv1plannedidskip) | Marquer une séance comme passée |
+| POST | [`/api/v1/projection`](#post-apiv1projection) | Simuler la charge et contrôler les règles |
+| GET | [`/api/v1/rules`](#règles-dentraînement-et-projection-de-charge) | Contraintes appliquées par le serveur |
+| GET / PUT | [`/api/v1/checkins`](#check-ins) | Ressenti quotidien |
+| GET / PUT | [`/api/v1/availability`](#disponibilités) | Temps disponible par jour (règles + exceptions) |
+| GET | [`/api/v1/ride-envelope`](#get-apiv1ride-envelope) | Sorties possibles un jour donné, TSS typique et faisabilité |
+| GET | [`/api/v1/coach-note`](#coach-note) | Message affiché en haut du dashboard |
+| PUT | [`/api/v1/coach-note`](#coach-note) | Remplacer (ou effacer) ce message |
 | GET | [`/api/v1/planned`](#get-apiv1planned) | Séances planifiées |
 | POST | [`/api/v1/planned`](#post-apiv1planned) | Planifier une séance |
 | DELETE | [`/api/v1/planned/{id}`](#delete-apiv1plannedid) | Retirer une séance du calendrier |
@@ -144,6 +159,9 @@ Dernières sorties, de la plus récente à la plus ancienne.
     "id": 20449027159,
     "sport": "ride",
     "sport_type": "Ride",
+    "indoor": false,
+    "power_source": "pedals",
+    "has_hr": true,
     "started_at": "2026-10-04T09:52:00Z",
     "title": "Sortie du dimanche",
     "distance_km": 95.3,
@@ -169,6 +187,7 @@ Dernières sorties, de la plus récente à la plus ancienne.
 - `tss_load` : ce que la sortie ajoute à la charge totale — égal à `tss` pour le vélo, `tss` × `hr_tss_coefficient` pour une course. Le `tss` d'une course reste son hrTSS brut.
 - Les champs de puissance et `intensity_factor` sont `null` quand la donnée n'existe pas (toujours le cas pour une course).
 - Les sorties importées depuis un fichier FIT/GPX ont un `id` négatif.
+- Champs dérivés : `indoor` (`true` pour une sortie `VirtualRide`, trainer/Zwift), `power_source` (`none` sans puissance, `trainer` en intérieur, `pedals` en extérieur — Strava ne distingue pas plus finement), `has_hr` (une FC moyenne existe).
 
 ## GET /api/v1/activities/{id}
 
@@ -277,27 +296,204 @@ Synthèse de l'entraînement récent.
 
 ## GET /api/v1/workouts
 
-Les modèles de séance réutilisables (créés dans le concepteur ou générés par le digest). Utilise un `id` comme `workout_id` pour planifier.
+Les modèles de séance réutilisables : créés dans le concepteur, générés par le digest, ou importés du catalogue (ex. plans Zwift, `category` = `Depuis Zwift`). Utilise un `id` comme `workout_id` pour planifier.
 
-Pas de paramètre.
+Paramètres (tous facultatifs, combinables) :
+
+| Paramètre | Description |
+|---|---|
+| `category` | Catégorie du catalogue (`Depuis Zwift`…). Voir `/workouts/categories` |
+| `group` | Plan au sein de la catégorie (`group_key`, ex. `build-me-up`) |
+| `source` | Origine exacte : `manual`, `digest`… |
+| `sport` | `cycling`, `running` ou `other` |
+| `q` | Sous-chaîne du nom (insensible à la casse) |
+| `min_duration_min`, `max_duration_min` | Bornes de durée estimée |
+| `min_tss`, `max_tss` | Bornes de TSS estimé (au FTP courant) |
+| `min_if`, `max_if` | Bornes d'intensity factor (calculé au FTP courant) |
+| `min_zone_time` | Temps minimal par zone de puissance, `zone:minutes[,zone:minutes]` (zones 1–7) : `4:20` = au moins 20 min en Z4, `4:10,5:5` = les deux conditions. `400` si mal formé |
+| `tag` | Type de séance (voir plus bas) : `recuperation`, `endurance`, `tempo`, `seuil`, `vo2`, `anaerobie`. Plusieurs valeurs séparées par des virgules = l'une d'elles |
+| `target_tss` | Trie par proximité de ce TSS (le plus proche d'abord) au lieu de l'ordre habituel |
+| `exclude_done_within_days` | Écarte les modèles déjà réalisés (séance planifiée `done`) dans les N derniers jours |
+| `steps` | `true` pour inclure la structure complète (`workout`). Absent par défaut : le catalogue est volumineux |
+| `limit` / `offset` | Pagination (`limit` défaut 200, max 500) |
+
+Avec `category` ou `group`, l'ordre est celui du plan (`position`) ; sinon du plus récent au plus ancien.
 
 ```json
 {
-  "count": 1,
+  "total": 1, "count": 1,
   "workouts": [{
     "id": 4,
     "name": "Over-under 2x12",
     "source": "manual",
     "sport": "cycling",
+    "category": null, "group_key": null, "group_name": null, "subgroup": null,
+    "position": 0,
+    "description": null, "source_url": null,
     "duration_min": 55.0,
     "estimated_tss": 62,
-    "estimated_distance_km": 24.5,
-    "workout": {"name": "Over-under 2x12", "steps": [ "..." ]}
+    "intensity_factor": 0.88,
+    "power_zone_minutes": [5.0, 3.0, 10.0, 24.0, 0.0, 0.0, 0.0],
+    "tags": ["seuil"],
+    "plan": null,
+    "last_done": "2026-10-28",
+    "computed_at_ftp_w": 205,
+    "estimated_distance_km": 24.5
   }]
 }
 ```
 
-`source` : `manual` (créé dans le concepteur) ou `digest` (généré par le digest hebdomadaire). `sport` : `cycling`, `running` ou `other`. `estimated_tss` est une estimation à partir des puissances cibles moyennes.
+Pour une séance du catalogue : `group_key` / `group_name` identifient le plan (ex. `ftp-builder` / « FTP Builder »), `subgroup` la semaine, `position` l'ordre d'origine, `source_url` la page d'origine. `estimated_tss` est une estimation à partir des puissances cibles moyennes.
+
+Champs **calculés à la volée au FTP courant** (`computed_at_ftp_w`), jamais figés : `intensity_factor`, `power_zone_minutes` (minutes en Z1…Z7 ; les rampes sont réparties sur les zones traversées) et `tags`, déduits de la répartition : `recuperation` (IF < 0,55), `endurance` (≥ 70 % en Z1–Z2 et IF < 0,75), `tempo` (≥ 15 min en Z3), `seuil` (≥ 10 min en Z4), `vo2` (≥ 5 min en Z5), `anaerobie` (≥ 2 min en Z6–Z7). Une séance peut en cumuler plusieurs. `plan` (`null` hors catalogue) regroupe `category`, `group_key`, `group_name`, `subgroup`, `position` : le plan d'origine. `last_done` est la date de la dernière séance planifiée réalisée à partir de ce modèle (`null` sinon).
+
+## GET /api/v1/workouts/{id}
+
+Un modèle, mêmes champs que ci-dessus plus `workout` (`{"name": ..., "steps": [...]}`, format décrit sous `POST /planned`). `404` si inconnu.
+
+## GET /api/v1/workouts/categories
+
+Sommaire du catalogue :
+
+```json
+{"categories": [{"category": "Depuis Zwift", "groups": [
+  {"group_key": "ftp-builder", "group_name": "FTP Builder", "count": 24}]}]}
+```
+
+## Coach note
+
+Un court message libre (1000 caractères max, texte brut) affiché en bandeau en haut du dashboard, pour qu'un agent laisse une consigne à l'utilisateur (« semaine douce après la sortie du week-end »). Une seule note à la fois ; l'utilisateur peut l'effacer depuis le dashboard.
+
+- `GET /api/v1/coach-note` → `{"message": "...", "author": "coach", "updated_at": "2026-11-10 08:00:00"}` ou `{"message": null}`.
+- `PUT /api/v1/coach-note` (clé `write`) avec `{"message": "...", "author": "coach"}` remplace la note ; `author` est facultatif ; un `message` vide l'efface. `400` si plus de 1000 caractères.
+
+## Règles d'entraînement et projection de charge
+
+Le serveur applique des contraintes dures, réglables dans `/settings` (« Règles d'entraînement ») : un agent les voit dans les réponses mais ne peut pas les contourner.
+
+| Règle (`rule`) | Défaut | Violation si… |
+|---|---|---|
+| `consecutive_intense` | 2 | plus de N jours intenses de suite |
+| `no_rest_day` | 1 | moins de N jours de repos (TSS du jour < 10) sur 7 jours glissants |
+| `ctl_ramp` | +6 | le CTL gagne plus de N points en 7 jours |
+| `tsb_floor` | −25 | le TSB passe sous N |
+
+Un jour est **intense** si son IF atteint 0,85 ou si son TSS atteint 100 (réglable aussi).
+
+`GET /api/v1/rules` renvoie les valeurs en vigueur.
+
+### POST /api/v1/projection
+
+Simulation, **rien n'est écrit** (accessible avec une clé `read`). Projette CTL/ATL/TSB jour par jour avec les mêmes constantes que le dashboard, en comptant les séances déjà au calendrier (statuts `planned` et `confirmed`) plus celles que tu ajoutes.
+
+```json
+{"sessions": [
+  {"date": "2026-11-14", "workout_id": 12},
+  {"date": "2026-11-15", "tss": 150, "intensity_factor": 0.9}
+], "include_planned": true}
+```
+
+Chaque séance donne soit `workout_id` (TSS et IF calculés au FTP courant), soit `tss` (avec `intensity_factor` facultatif). Les dates vont d'aujourd'hui à 120 jours (une séance du jour s'ajoute à la charge déjà roulée, en supposant Strava synchronisé ; si une sortie est déjà enregistrée aujourd'hui, la séance planifiée du jour n'est pas recomptée). Réponse :
+
+```json
+{"from": "2026-11-10", "ok": false,
+ "days": [{"date": "2026-11-11", "tss": 0, "ctl": 52.1, "atl": 48.0, "tsb": 4.1, "intense": false}],
+ "violations": [{"rule": "consecutive_intense", "date": "2026-11-16", "message": "3 jours intenses de suite (max 2)"}],
+ "rules": {"...": "..."}}
+```
+
+Une violation n'est signalée qu'une fois par série (le premier jour fautif).
+
+## Check-ins
+
+`PUT /api/v1/checkins/{date}` (clé `write`) enregistre le ressenti du jour, un par date (le suivant le remplace) : `{"legs": 1-5, "motivation": 1-5, "rhr_bpm": 48, "note": "...", "weather": "..."}` (`rhr_bpm`, `note` et `weather` facultatifs). `GET /api/v1/checkins?from=&to=` les liste, du plus récent au plus ancien (30 derniers jours par défaut).
+
+## Disponibilités
+
+Temps disponible pour rouler, jour par jour : une règle par défaut selon le jour de la semaine (réglable dans `/settings`, par défaut 90 min en soirée du lundi au vendredi, 180 min en journée le week-end), remplacée par une exception à la date quand il y en a une.
+
+`GET /api/v1/availability?from=&to=` (14 jours à partir d'aujourd'hui par défaut, 92 jours au plus) :
+
+```json
+{"from": "2026-11-10", "to": "2026-11-11", "count": 2, "days": [
+  {"date": "2026-11-10", "available_min": 90, "time_of_day": "soir", "context": "travail", "source": "regle_par_defaut", "note": null},
+  {"date": "2026-11-11", "available_min": 300, "time_of_day": "journee", "context": "vacances", "source": "exception", "note": "congés"}
+]}
+```
+
+`PUT /api/v1/availability` (clé `write`) crée ou remplace l'**exception** d'un jour (`{"date": "2026-11-11", ...}`) ou d'une plage (`{"from": "...", "to": "...", ...}`, 92 jours au plus, bornes incluses), avec `available_min` (0 à 720), `time_of_day` (`soir` | `journee`), `context` (`travail` | `vacances` | `autre`) et une `note` facultative (300 caractères). Les dates vont d'aujourd'hui à plus tard (`400` sinon). Les règles par défaut ne sont modifiables que depuis l'interface, et il n'existe pas de suppression par l'API (les exceptions se suppriment dans `/settings`).
+
+## GET /api/v1/ride-envelope
+
+Pour un jour et le temps disponible, les types de sortie possibles, ce qu'ils coûtent d'habitude en TSS et ce que les règles en disent. Lecture seule, aucune écriture.
+
+| Paramètre | Défaut | Description |
+|---|---|---|
+| `date` | obligatoire | `YYYY-MM-DD`, aujourd'hui ou plus tard (120 jours au plus) |
+| `available_min` | disponibilité du jour | Temps pour rouler, de 0 à 720 |
+
+```json
+{"date": "2026-11-14", "available_min": 180, "available_source": "regle_par_defaut",
+ "time_of_day": "journee", "context": "autre", "slot_type": "journee",
+ "scenarios": [
+  {"scenario": "moyenne", "intent": "endurance", "duration_min": 145, "tss_range": [74, 96],
+   "tss_source": "history", "sample_size": 6, "source": "computed",
+   "ctl_after": 52.4, "tsb_after": -9.8, "feasibility": "ok", "rule": null},
+  {"scenario": "longue_denivele", "intent": "denivele", "duration_min": 180, "tss_range": [130, 216],
+   "tss_source": "engine_default", "sample_size": 1, "source": "estimated",
+   "ctl_after": 54.1, "tsb_after": -27.3, "feasibility": "deconseille",
+   "rule": {"rule": "tsb_floor", "date": "2026-11-14", "message": "TSB -27.3 sous le plancher de -25.0"}}
+ ]}
+```
+
+- **Scénarios** : `tranquille` (la moitié du temps, dès 30 min), `moyenne` (80 % du temps, dès 60 min) et `longue_denivele` (tout le temps, dès 150 min). Seuls ceux qui tiennent dans le temps disponible sont renvoyés. `slot_type` : `soiree_courte` (jusqu'à 90 min), `soiree_longue` (jusqu'à 150 min) ou `journee`.
+- **`tss_range`** : le quart central (25ᵉ à 75ᵉ percentile) du TSS de tes sorties à vélo des 12 derniers mois dont la durée est proche (±25 %) ; pour `longue_denivele`, seulement celles qui grimpent au moins 250 m par heure. Il faut au moins 3 sorties (`sample_size`), sinon la fourchette vient du moteur (60 % à 100 % du plafond de l'intention) : `tss_source` vaut alors `engine_default` et `source` `estimated` au lieu de `history` et `computed`. Le haut est borné par ce que l'intention permet sur la durée.
+- **`ctl_after`, `tsb_after`** : projetés le jour même, pour une sortie au milieu de la fourchette, avec le calendrier (`planned` et `confirmed`).
+- **`feasibility`** : `deconseille` si la sortie au milieu de la fourchette viole une règle dure qu'elle n'enfreignait pas déjà, `limite` si seul le haut de la fourchette la viole, `ok` sinon. `rule` donne la première violation qui l'explique.
+- Les séances déjà planifiées ce jour-là sont ignorées : l'enveloppe décrit ce qui pourrait les remplacer.
+
+## Propositions et statuts de séance
+
+Cycle de vie (`status`) : `planned` (créée à la main ou par `POST /planned`), `proposed` (suggérée par un agent), `confirmed`, `done`, `skipped`, `rejected`. `done`, `skipped` et `rejected` sont définitifs. Seules `planned` et `confirmed` comptent dans la projection de charge ; `skipped` et `rejected` disparaissent du calendrier du dashboard (elles restent en base et dans l'API), et une `proposed` y apparaît en pointillés avec un « ? ».
+
+### POST /api/v1/proposals
+
+Clé `write`. Suggère une séance à partir d'un modèle ; l'utilisateur la **confirme ou la refuse** depuis sa page dans le dashboard (un agent ne peut pas valider lui-même).
+
+```json
+{"date": "2026-11-14", "workout_id": 12, "rationale": "Séance clé de la semaine, TSB à +8", "idempotency_key": "w46-sat"}
+```
+
+- `201` avec la séance (`status: "proposed"`, `rationale`, `estimated_tss`, `estimated_if`…).
+- `200` avec la séance déjà créée si la même `idempotency_key` est rejouée.
+- `422` si la séance introduirait une violation des [règles](#règles-dentraînement-et-projection-de-charge) qui n'existait pas déjà (le message liste les règles, avec leur date) : rien n'est enregistré. Une violation déjà présente dans le calendrier n'est pas imputée à la proposition.
+- `400` : date antérieure à aujourd'hui ou à plus de 120 jours, `rationale` vide ou de plus de 500 caractères, clé de plus de 100 caractères ; `404` : modèle inconnu.
+
+La date peut être aujourd'hui : la séance s'ajoute alors à la charge déjà roulée (Strava supposé synchronisé).
+
+#### Sorties libres
+
+À la place de `workout_id`, `free_ride_budget` propose une sortie sans structure imposée, bornée par un budget (donnez l'un ou l'autre, jamais les deux : `400`) :
+
+```json
+{"date": "2026-11-15", "rationale": "Sortie longue tranquille", "idempotency_key": "w46-sun",
+ "free_ride_budget": {"duration_max_min": 150, "intent": "endurance", "tss_range": [70, 110]}}
+```
+
+- `intent` : `endurance` | `denivele` | `recuperation`. `tss_range` est facultatif : sans lui, le moteur le calcule à partir de la durée et de l'intention (60 % à 100 % du plafond).
+- Le budget est borné par le moteur (`422` sinon) : `duration_max_min` (20 minimum) ne peut pas dépasser le temps disponible ce jour-là ([disponibilités](#disponibilités)), et le TSS maximal ne peut pas dépasser ce que l'intention permet sur cette durée (IF plafond 0,75 en endurance, 0,85 en dénivelé, 0,60 en récupération ; soit environ 56, 72 et 36 TSS par heure).
+- Règles dures : la proposition est vérifiée avec le haut du budget (pire cas). Une fois confirmée, la sortie compte dans la projection au milieu de la fourchette.
+- La séance renvoyée a `kind: "free_ride"` et un objet `free_ride_budget` (`tss_range`, `duration_max_min`, `intent`) ; les séances de bibliothèque ont `kind: "workout"`.
+
+#### Réalisation automatique
+
+Une séance `planned` ou `confirmed` dont le jour est arrivé passe seule en `done` dès qu'une sortie du même sport existe ce jour-là (vélo : `Ride` ou `VirtualRide` ; course : `Run` ou `TrailRun`). Chaque sortie ne correspond qu'à une séance, et `activity_id` indique laquelle. Le rapprochement se fait à chaque lecture du calendrier ou de la projection ; une séance non réalisée reste `planned` jusqu'à ce qu'on la passe (`skip`). La charge réelle remplace alors l'estimation dans la projection.
+
+### POST /api/v1/planned/{id}/skip
+
+Clé `write`. Passe une séance à venir à `skipped` ; corps `{"reason": "jambes lourdes"}` (facultatif, ajouté aux notes). `409` si le statut est définitif, `404` si elle n'existe pas.
+
+Les séances planifiées portent maintenant `status` (`planned`, `proposed`, `confirmed`, `done`, `skipped`, `rejected`), `rationale`, `estimated_if`, `kind`, `free_ride_budget` et `activity_id`.
 
 ## GET /api/v1/planned
 
@@ -355,7 +551,8 @@ Il faut exactement un de `workout_id` ou `workout`.
 Exemple :
 
 ```bash
-curl -X POST http://localhost:3000/api/v1/planned \
+curl -X POST http://localhost:3001/api/v1/planned \
+  -H "Authorization: Bearer $TOKEN" \
   -H 'content-type: application/json' \
   -d '{
     "date": "2026-10-12",
@@ -374,7 +571,8 @@ curl -X POST http://localhost:3000/api/v1/planned \
 À partir d'un modèle :
 
 ```bash
-curl -X POST http://localhost:3000/api/v1/planned \
+curl -X POST http://localhost:3001/api/v1/planned \
+  -H "Authorization: Bearer $TOKEN" \
   -H 'content-type: application/json' \
   -d '{"date": "2026-10-14", "workout_id": 4, "name": "Seuil (version courte)"}'
 ```

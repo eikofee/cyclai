@@ -121,9 +121,23 @@ Sans clé Anthropic dans `/settings`, aucun appel n'est fait et rien n'est dépe
 | Zone de puissance (`power_zone`) | 1 à 7, % du FTP | vélo |
 | FC (`hr_range`) | bpm | vélo, course |
 | Zone de FC (`hr_zone`) | 1 à 5 | vélo, course |
+| % FTP (`ftp_pct_range`) | % du FTP des réglages (`low == high` pour une valeur fixe) | vélo |
+| Rampe (`ftp_ramp`) | `from` → `to` en % FTP, croissante ou décroissante | vélo |
 | Allure (`pace_range`) | min/km (accepte `"m:ss"`) | course |
 
 Les cibles FC et allure sont dessinées en pointillés ; leur hauteur sur le graphique (et les TSS estimés) vient d'une **intensité équivalente** : puissance typique de la zone FC, ou allure seuil / allure de l'étape pour l'allure (l'**allure seuil** se règle dans `/settings`, 75 % par défaut si non réglée). Changer le type de cible d'une étape conserve son intensité approximative. La distance estimée d'une séance de course vient des allures des étapes ; celle du vélo, de la vitesse estimée selon la puissance et le terrain (≈ 30 km/h en Z2-Z3 sur le plat, 12-15 km/h en montée). C'est une **estimation indicative**.
+
+## Séances « Depuis Zwift »
+
+La page `/workouts` contient deux catégories : **Depuis Zwift · Plans d'entraînement** (les 16 plans **100 % vélo** de whatsonzwift.com : FTP Builder, Build Me Up, Gravel Grinder, TT TuneUp, Zwift Racing…, 518 séances) et **Depuis Zwift · Collections** (les 25 collections de la bibliothèque de séances de Zwift : Sweet Spot, Threshold, VO2 Max, Climbing, Zwift Academy, Zwift Camp…, 709 séances), soit 1 227 séances. Les plans course à pied et multisport, les séances de course à pied des collections, les collections « legacy » et les jours de repos ou de course sont ignorés. Chaque plan ou collection s'ouvre sur sa page (`/workouts/plans/{clé}`), séances rangées par **semaine** ou par sous-groupe du site (« ZA 2019 », « Short »…), en blocs repliables. Une même séance peut apparaître dans plusieurs groupes, comme sur le site.
+
+Les séances sont **en lecture seule** (ni modification ni suppression) et exprimées en **% de FTP** (cibles `ftp_pct_range` et `ftp_ramp`) : les watts affichés suivent la FTP des réglages. Un clic ouvre le détail : profil (les rampes sont tracées en pente), liste des étapes avec % FTP et watts, durée / TSS / IF, lien de retour vers le plan.
+
+- **Planifier** : date + « Ajouter au calendrier » (copie des étapes, qui continue de suivre la FTP), ou « Modifier avant de planifier » pour passer par le concepteur.
+- **Export Garmin** (`/workouts/{id}/fit`, aussi `/planned/{id}/fit` pour une séance du calendrier) : fichier `.fit` à copier dans `GARMIN/NewFiles` de la montre. Garmin n'a pas de rampe : chaque rampe devient une **plage de puissance cible** (point bas → point haut). Par défaut les cibles restent en **% FTP** (la montre applique sa propre FTP) ; `?mode=watts` les convertit avec la FTP de l'application. Disponible pour toutes les séances (FC et allure inclus). Garmin limite un entraînement à 50 étapes : 3 séances du catalogue (Zwift Racing, Fast Track Fitness) les dépassent légèrement.
+- **Export Zwift** (`.zwo`) pour les séances vélo, rampes comprises.
+
+**Données** : `tools/scrape_zwift.py` (à relancer pour rafraîchir ; `--cache` pour rejouer l'analyse sans retélécharger) écrit `data/zwift_plans.json`, embarqué dans le binaire et importé au démarrage (`zwift.rs`). Chaque séance porte une **catégorie** (`category`), un **plan ou une collection** (`group_key` / `group_name`), une **semaine ou un sous-groupe** (`subgroup`) et un ordre (`position`) ; la mise à jour se fait sur `external_id` (ids stables), et une séance qui disparaît du catalogue est supprimée. Les descriptions restent en anglais (texte source). Les cibles « free ride » sont dessinées à 60 % FTP, les efforts « MAX » à 150 %, avec une note.
 
 ## Séances planifiées et calendrier
 
@@ -132,6 +146,18 @@ Le calendrier du dashboard montre 6 semaines (2 passées, 4 à venir, alignées 
 Une séance planifiée **possède sa propre copie des étapes** (table `planned_workouts`). Elle peut venir d'un modèle (`workout_id`, informatif) ou être unique à son jour ; modifier ou supprimer le modèle ne la change pas, et plusieurs séances par jour sont possibles.
 
 Ajout : clic sur un jour du calendrier (`/planned/new?date=…`), bouton « Planifier » d'un modèle, champ « Planifier aussi cette séance le » du concepteur, ou l'API ([API.md](../API.md#post-apiv1planned)). Édition / suppression : clic sur la séance dans le calendrier.
+
+## Agents IA : API et MCP
+
+CyclAI peut être piloté par un agent (Claude) sans jamais lui laisser le dernier mot : **le moteur calcule, l'agent choisit et explique**.
+
+- **Règles dures**, appliquées côté serveur et réglables dans /settings : rampe de CTL (+6/semaine par défaut), plancher de TSB (−25), jours intenses (IF ≥ 0,85 ou TSS ≥ 100), 2 jours intenses consécutifs au plus, 1 jour de repos par semaine. Une proposition qui en enfreint une nouvellement est refusée.
+- **Propositions** : l'agent propose une séance (de la bibliothèque, ou une sortie libre bornée par un budget), y compris le jour même ; elle apparaît `proposed` et c'est vous qui la confirmez ou la rejetez dans le dashboard. Aucune suppression n'est possible par l'agent.
+- **Disponibilités** : défauts par jour de semaine et exceptions par date (/settings → Disponibilités) ; elles bornent les sorties libres.
+- **Enveloppe de sortie** : pour un jour et un temps donnés, scénarios (tranquille, moyenne, longue avec dénivelé), fourchette de TSS apprise de votre historique, faisabilité au regard des règles.
+- **Recherche de séances** : filtres sur le temps par zone, le type, le TSS cible, et ce qui n'a pas été fait récemment ; IF, TSS et zones sont recalculés au FTP courant.
+- **Note du coach** : un message court affiché en haut du dashboard.
+- Deux accès : l'API REST (JWT signé, [API.md](../API.md)) et le serveur **MCP** avec OAuth pour Claude web / mobile ([MCP.md](MCP.md)).
 
 ## Page d'une activité
 

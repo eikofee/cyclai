@@ -68,6 +68,180 @@ pub struct Planned {
     pub workout_id: Option<i64>,
     pub source: String,
     pub sport: String,
+    pub status: String,
+    pub rationale: Option<String>,
+    /// `workout` (structured steps) or `free_ride` (budget only).
+    pub kind: String,
+    pub budget_tss_min: Option<f64>,
+    pub budget_tss_max: Option<f64>,
+    pub budget_duration_max_min: Option<i64>,
+    pub intent: Option<String>,
+    /// The ride a `done` session was matched with.
+    pub activity_id: Option<i64>,
+}
+
+const COLUMNS: &str = "id, planned_date, name, steps_json, notes, workout_id, source, sport, status, rationale, \
+                       kind, budget_tss_min, budget_tss_max, budget_duration_max_min, intent, activity_id";
+
+impl Planned {
+    pub fn is_free_ride(&self) -> bool {
+        self.kind == "free_ride"
+    }
+
+    /// `(minutes, tss)` this session is expected to add to the load: the
+    /// steps' estimate for a workout, the middle of the budget for a free ride.
+    pub fn load_estimate(&self, athlete: &Athlete) -> (f64, f64) {
+        if self.is_free_ride() {
+            let minutes = self.budget_duration_max_min.unwrap_or(0) as f64;
+            let tss = (self.budget_tss_min.unwrap_or(0.0) + self.budget_tss_max.unwrap_or(0.0)) / 2.0;
+            return (minutes, tss);
+        }
+        serde_json::from_str::<Workout>(&self.steps_json).map(|w| w.load_estimate(athlete)).unwrap_or((0.0, 0.0))
+    }
+}
+
+pub const INTENTS: [&str; 3] = ["endurance", "denivele", "recuperation"];
+
+pub fn intent_label(intent: &str) -> &'static str {
+    match intent {
+        "denivele" => "dénivelé",
+        "recuperation" => "récupération",
+        _ => "endurance",
+    }
+}
+
+/// Highest IF a ride of that intent is expected to reach; bounds the TSS a
+/// free-ride budget may claim for its duration.
+fn intent_if_cap(intent: &str) -> f64 {
+    match intent {
+        "recuperation" => 0.60,
+        "denivele" => 0.85,
+        _ => 0.75,
+    }
+}
+
+/// Most TSS a ride of `minutes` can plausibly give for that intent.
+pub fn tss_ceiling(intent: &str, minutes: i64) -> f64 {
+    let cap = intent_if_cap(intent);
+    minutes as f64 / 60.0 * 100.0 * cap * cap
+}
+
+/// Shortest free ride worth planning.
+pub const FREE_RIDE_MIN_MINUTES: i64 = 20;
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct FreeRideBudget {
+    pub tss_min: f64,
+    pub tss_max: f64,
+    pub duration_max_min: i64,
+    pub intent: String,
+}
+
+/// Builds the budget of a free ride on a day with `available_min` to ride.
+/// Without `tss_range` the engine fills it in from the duration and the
+/// intent. The error is a user-facing message (the request is well-formed but
+/// the engine refuses it).
+pub fn free_ride_budget(
+    tss_range: Option<(f64, f64)>,
+    duration_max_min: i64,
+    intent: &str,
+    available_min: i64,
+) -> Result<FreeRideBudget, String> {
+    if !INTENTS.contains(&intent) {
+        return Err(format!("`intent` must be one of: {}", INTENTS.join(", ")));
+    }
+    if duration_max_min < FREE_RIDE_MIN_MINUTES {
+        return Err(format!("`duration_max_min` must be at least {FREE_RIDE_MIN_MINUTES}"));
+    }
+    if duration_max_min > available_min {
+        return Err(format!(
+            "`duration_max_min` ({duration_max_min}) exceeds the {available_min} min available that day (see /api/v1/availability)"
+        ));
+    }
+    let ceiling = tss_ceiling(intent, duration_max_min);
+    let (tss_min, tss_max) = match tss_range {
+        Some((lo, hi)) => {
+            if !(lo.is_finite() && hi.is_finite()) || lo < 0.0 || hi < lo {
+                return Err("`tss_range` must be [min, max] with 0 <= min <= max".to_string());
+            }
+            if hi > ceiling.ceil() {
+                return Err(format!(
+                    "`tss_range` max {hi:.0} is out of reach for {duration_max_min} min of {intent} (at most {:.0})",
+                    ceiling.floor()
+                ));
+            }
+            (lo, hi)
+        }
+        None => ((ceiling * 0.6).round(), ceiling.round()),
+    };
+    Ok(FreeRideBudget { tss_min, tss_max, duration_max_min, intent: intent.to_string() })
+}
+
+pub async fn insert_free_ride(
+    pool: &SqlitePool,
+    date: NaiveDate,
+    budget: &FreeRideBudget,
+    source: &str,
+) -> anyhow::Result<i64> {
+    let name = format!("Sortie libre — {}", intent_label(&budget.intent));
+    let steps = serde_json::json!({ "name": name, "steps": [] }).to_string();
+    let result = sqlx::query(
+        "INSERT INTO planned_workouts (planned_date, name, steps_json, source, sport, kind, budget_tss_min, \
+         budget_tss_max, budget_duration_max_min, intent) VALUES (?, ?, ?, ?, 'cycling', 'free_ride', ?, ?, ?, ?)",
+    )
+    .bind(date.to_string())
+    .bind(&name)
+    .bind(steps)
+    .bind(source)
+    .bind(budget.tss_min)
+    .bind(budget.tss_max)
+    .bind(budget.duration_max_min)
+    .bind(&budget.intent)
+    .execute(pool)
+    .await?;
+    Ok(result.last_insert_rowid())
+}
+
+/// Marks as `done` the `planned` / `confirmed` sessions of `today` and earlier
+/// for which a ride exists on their day (a ride of the session's sport, each
+/// ride matching at most one session), and links them. Returns how many
+/// sessions were completed. Idempotent; called whenever the plan is read.
+pub async fn reconcile(pool: &SqlitePool, today: NaiveDate) -> anyhow::Result<u64> {
+    let pending: Vec<(i64, String, String)> = sqlx::query_as(
+        "SELECT id, planned_date, sport FROM planned_workouts \
+         WHERE status IN ('planned', 'confirmed') AND planned_date <= ? ORDER BY planned_date, id",
+    )
+    .bind(today.to_string())
+    .fetch_all(pool)
+    .await?;
+    let mut done = 0;
+    for (id, date, sport) in pending {
+        let types = match Sport::from_db(&sport) {
+            Sport::Cycling => "('Ride', 'VirtualRide')",
+            Sport::Running => "('Run', 'TrailRun')",
+            Sport::Other => continue,
+        };
+        let activity: Option<i64> = sqlx::query_scalar(&format!(
+            "SELECT a.id FROM activities a WHERE date(a.started_at) = ? AND a.sport_type IN {types} \
+             AND NOT EXISTS (SELECT 1 FROM planned_workouts p WHERE p.activity_id = a.id) \
+             ORDER BY a.duration_s DESC LIMIT 1"
+        ))
+        .bind(&date)
+        .fetch_optional(pool)
+        .await?;
+        if let Some(activity) = activity {
+            let r = sqlx::query(
+                "UPDATE planned_workouts SET status = 'done', activity_id = ?, updated_at = datetime('now') \
+                 WHERE id = ? AND status IN ('planned', 'confirmed')",
+            )
+            .bind(activity)
+            .bind(id)
+            .execute(pool)
+            .await?;
+            done += r.rows_affected();
+        }
+    }
+    Ok(done)
 }
 
 /// A validated workout ready to store: name + the full Workout JSON with the
@@ -163,6 +337,72 @@ pub async fn update(
     Ok(result.rows_affected() > 0)
 }
 
+/// Allowed moves of a session's `status`. `proposed` (suggested by an agent)
+/// is settled by the user in the UI: `confirmed` or `rejected`. Anything still
+/// upcoming can be `skipped`. `done`, `skipped` and `rejected` are final.
+pub fn can_transition(from: &str, to: &str) -> bool {
+    matches!(
+        (from, to),
+        ("proposed", "confirmed" | "rejected" | "skipped")
+            | ("planned" | "confirmed", "skipped" | "done")
+            | ("proposed", "done")
+    )
+}
+
+#[cfg(test)]
+mod status_tests {
+    use super::can_transition as ok;
+
+    #[test]
+    fn proposals_are_settled_and_final_states_stay_final() {
+        assert!(ok("proposed", "confirmed") && ok("proposed", "rejected"));
+        assert!(ok("planned", "skipped") && ok("confirmed", "done"));
+        for from in ["done", "skipped", "rejected"] {
+            for to in ["planned", "proposed", "confirmed", "rejected", "skipped", "done"] {
+                assert!(!ok(from, to), "{from} -> {to}");
+            }
+        }
+        assert!(!ok("planned", "confirmed"), "only proposals are confirmed");
+        assert!(!ok("confirmed", "rejected"));
+    }
+}
+
+/// Moves a session to `to` if the transition is allowed. Returns `Ok(false)`
+/// when the session doesn't exist or the move isn't allowed.
+pub async fn set_status(pool: &SqlitePool, id: i64, to: &str) -> anyhow::Result<bool> {
+    let Some(current) = get(pool, id).await? else { return Ok(false) };
+    if !can_transition(&current.status, to) {
+        return Ok(false);
+    }
+    let result = sqlx::query(
+        "UPDATE planned_workouts SET status = ?, updated_at = datetime('now') WHERE id = ? AND status = ?",
+    )
+    .bind(to)
+    .bind(id)
+    .bind(&current.status)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected() > 0)
+}
+
+/// Turns a freshly inserted session into an agent proposal.
+pub async fn mark_proposal(pool: &SqlitePool, id: i64, rationale: &str, idempotency_key: Option<&str>) -> anyhow::Result<()> {
+    sqlx::query("UPDATE planned_workouts SET status = 'proposed', rationale = ?, idempotency_key = ? WHERE id = ?")
+        .bind(rationale)
+        .bind(idempotency_key)
+        .bind(id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+pub async fn find_by_idempotency_key(pool: &SqlitePool, key: &str) -> anyhow::Result<Option<Planned>> {
+    Ok(sqlx::query_as(&format!("SELECT {COLUMNS} FROM planned_workouts WHERE idempotency_key = ?"))
+    .bind(key)
+    .fetch_optional(pool)
+    .await?)
+}
+
 pub async fn delete(pool: &SqlitePool, id: i64) -> anyhow::Result<bool> {
     let result = sqlx::query("DELETE FROM planned_workouts WHERE id = ?")
         .bind(id)
@@ -172,9 +412,7 @@ pub async fn delete(pool: &SqlitePool, id: i64) -> anyhow::Result<bool> {
 }
 
 pub async fn get(pool: &SqlitePool, id: i64) -> anyhow::Result<Option<Planned>> {
-    Ok(sqlx::query_as(
-        "SELECT id, planned_date, name, steps_json, notes, workout_id, source, sport FROM planned_workouts WHERE id = ?",
-    )
+    Ok(sqlx::query_as(&format!("SELECT {COLUMNS} FROM planned_workouts WHERE id = ?"))
     .bind(id)
     .fetch_optional(pool)
     .await?)
@@ -182,10 +420,9 @@ pub async fn get(pool: &SqlitePool, id: i64) -> anyhow::Result<Option<Planned>> 
 
 /// Planned sessions with `from <= date < to` (end exclusive), oldest first.
 pub async fn list_between(pool: &SqlitePool, from: NaiveDate, to: NaiveDate) -> anyhow::Result<Vec<Planned>> {
-    Ok(sqlx::query_as(
-        "SELECT id, planned_date, name, steps_json, notes, workout_id, source, sport FROM planned_workouts \
-         WHERE planned_date >= ? AND planned_date < ? ORDER BY planned_date, id",
-    )
+    Ok(sqlx::query_as(&format!(
+        "SELECT {COLUMNS} FROM planned_workouts WHERE planned_date >= ? AND planned_date < ? ORDER BY planned_date, id"
+    ))
     .bind(from.to_string())
     .bind(to.to_string())
     .fetch_all(pool)
@@ -215,6 +452,53 @@ mod tests {
                 {"type": "recovery", "duration": {"type": "time", "value": "5min"}, "target": {"type": "power_range", "low": 100, "high": 120}}
             ]}
         ]})
+    }
+
+    #[test]
+    fn free_ride_budget_is_bounded_by_the_day_and_the_intent() {
+        // 120 min of endurance (IF cap 0.75): ceiling 112 TSS. Default range = 60 %..100 %.
+        let b = free_ride_budget(None, 120, "endurance", 180).unwrap();
+        assert_eq!((b.tss_min, b.tss_max), (68.0, 113.0));
+        assert!(free_ride_budget(Some((40.0, 100.0)), 120, "endurance", 180).is_ok());
+        assert!(free_ride_budget(Some((40.0, 200.0)), 120, "endurance", 180).unwrap_err().contains("out of reach"));
+        assert!(free_ride_budget(Some((90.0, 50.0)), 120, "endurance", 180).is_err(), "min > max");
+        assert!(free_ride_budget(None, 120, "endurance", 90).unwrap_err().contains("available"));
+        assert!(free_ride_budget(None, 10, "endurance", 90).is_err(), "too short");
+        assert!(free_ride_budget(None, 60, "sprint", 90).unwrap_err().contains("intent"));
+        // Recovery is capped lower than hilly rides for the same duration.
+        assert!(tss_ceiling("recuperation", 60) < tss_ceiling("denivele", 60));
+    }
+
+    #[tokio::test]
+    async fn free_rides_count_at_mid_budget_and_complete_with_the_ride() {
+        let pool = test_pool().await;
+        let day = parse_date("2026-11-10").unwrap();
+        let budget = free_ride_budget(Some((40.0, 80.0)), 120, "endurance", 180).unwrap();
+        let free = insert_free_ride(&pool, day, &budget, "api").await.unwrap();
+        let p = get(&pool, free).await.unwrap().unwrap();
+        assert!(p.is_free_ride());
+        assert_eq!(p.load_estimate(&athlete()), (120.0, 60.0));
+
+        // No ride yet: stays upcoming, and a later day never completes it.
+        assert_eq!(reconcile(&pool, day).await.unwrap(), 0);
+        sqlx::query("INSERT INTO activities (id, started_at, duration_s, distance_m, elevation_gain_m, sport_type) VALUES (1, '2026-11-10T17:00:00Z', 5400, 40000, 300, 'Ride')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        // A run does not complete a cycling session.
+        sqlx::query("INSERT INTO activities (id, started_at, duration_s, distance_m, elevation_gain_m, sport_type) VALUES (2, '2026-11-10T07:00:00Z', 3000, 8000, 50, 'Run')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        // The day's ride is matched once the day has begun… but not before it.
+        assert_eq!(reconcile(&pool, day - chrono::Duration::days(1)).await.unwrap(), 0);
+        assert_eq!(reconcile(&pool, day).await.unwrap(), 1);
+        let done = get(&pool, free).await.unwrap().unwrap();
+        assert_eq!((done.status.as_str(), done.activity_id), ("done", Some(1)));
+        // Idempotent, and a second session on the same day can't reuse the ride.
+        let second = insert_free_ride(&pool, day, &budget, "api").await.unwrap();
+        assert_eq!(reconcile(&pool, day).await.unwrap(), 0);
+        assert_eq!(get(&pool, second).await.unwrap().unwrap().status, "planned");
     }
 
     #[test]

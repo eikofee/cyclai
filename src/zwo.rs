@@ -2,7 +2,7 @@
 //! target as a fraction of FTP, so power/HR/zone targets all go through
 //! `Target::power_frac`.
 
-use crate::workout::{Athlete, SimpleStep, Workout, WorkoutStep};
+use crate::workout::{Athlete, SimpleStep, Target, Workout, WorkoutStep};
 
 /// Fraction of FTP used for a step without a target (same default as the
 /// load estimate).
@@ -22,10 +22,13 @@ fn write_steps(steps: &[WorkoutStep], a: &Athlete, out: &mut String) {
         match step {
             WorkoutStep::Warmup(s) => ramp("Warmup", s, a, false, out),
             WorkoutStep::Cooldown(s) => ramp("Cooldown", s, a, true, out),
-            WorkoutStep::Interval(s) | WorkoutStep::Recovery(s) => {
-                let (lo, hi) = fracs(s, a);
-                steady(s, (lo + hi) / 2.0, out);
-            }
+            WorkoutStep::Interval(s) | WorkoutStep::Recovery(s) => match ramp_ends(s) {
+                Some((start, end)) => ramp_between("Ramp", s, start, end, out),
+                None => {
+                    let (lo, hi) = fracs(s, a);
+                    steady(s, (lo + hi) / 2.0, out);
+                }
+            },
             WorkoutStep::Repeat { count, steps } => match steps.as_slice() {
                 // Zwift's native on/off block; anything else is unrolled
                 // since .zwo has no nested repeats.
@@ -46,9 +49,19 @@ fn write_steps(steps: &[WorkoutStep], a: &Athlete, out: &mut String) {
     }
 }
 
-fn fracs(s: &SimpleStep, a: &Athlete) -> (f64, f64) {
-    use crate::workout::Target;
+/// Start and end (fractions of FTP) of an explicit `%FTP` ramp, in its own direction.
+pub fn ramp_ends(s: &SimpleStep) -> Option<(f64, f64)> {
     match &s.target {
+        Some(Target::FtpRamp { from, to }) => Some((from / 100.0, to / 100.0)),
+        _ => None,
+    }
+}
+
+/// Target as a (low, high) band of fractions of FTP.
+pub fn fracs(s: &SimpleStep, a: &Athlete) -> (f64, f64) {
+    match &s.target {
+        Some(Target::FtpPctRange { low, high }) => (low / 100.0, high / 100.0),
+        Some(Target::FtpRamp { from, to }) => (from.min(*to) / 100.0, from.max(*to) / 100.0),
         Some(Target::PowerRange { low, high }) if a.ftp_watts > 0.0 => (low / a.ftp_watts, high / a.ftp_watts),
         Some(Target::PowerZone { zone }) => crate::workout::POWER_ZONE_RANGES_FRAC[(*zone).clamp(1, 7) as usize - 1],
         Some(t) => {
@@ -71,8 +84,14 @@ fn steady(s: &SimpleStep, frac: f64, out: &mut String) {
 /// Warmup ramps up from the low to the high end of the target; a cooldown
 /// ramps down, so its start is the high end.
 fn ramp(tag: &str, s: &SimpleStep, a: &Athlete, down: bool, out: &mut String) {
-    let (lo, hi) = fracs(s, a);
-    let (start, end) = if down { (hi, lo) } else { (lo, hi) };
+    let (start, end) = ramp_ends(s).unwrap_or_else(|| {
+        let (lo, hi) = fracs(s, a);
+        if down { (hi, lo) } else { (lo, hi) }
+    });
+    ramp_between(tag, s, start, end, out)
+}
+
+fn ramp_between(tag: &str, s: &SimpleStep, start: f64, end: f64, out: &mut String) {
     let head = format!("    <{tag} Duration=\"{}\" PowerLow=\"{start:.3}\" PowerHigh=\"{end:.3}\"", secs(s));
     push_with_note_tag(head, tag, s, out);
 }
@@ -124,5 +143,18 @@ mod tests {
         assert!(x.contains("<IntervalsT Repeat=\"3\" OnDuration=\"300\" OffDuration=\"120\" OnPower=\"1.000\" OffPower=\"0.500\"/>"));
         assert_eq!(x.matches("<SteadyState").count(), 6);
         assert!(x.contains("<Cooldown Duration=\"300\" PowerLow=\"0.750\" PowerHigh=\"0.500\"/>"));
+    }
+
+    #[test]
+    fn exports_percent_ftp_ramps_in_their_own_direction() {
+        let w: Workout = serde_json::from_value(json!({"name": "Z", "steps": [
+            {"type": "interval", "duration": {"type": "time", "value": "4min"}, "target": {"type": "ftp_ramp", "from": 60, "to": 75}},
+            {"type": "interval", "duration": {"type": "time", "value": "5min"}, "target": {"type": "ftp_pct_range", "low": 53, "high": 53}},
+            {"type": "cooldown", "duration": {"type": "time", "value": "10min"}, "target": {"type": "ftp_ramp", "from": 60, "to": 40}}
+        ]})).unwrap();
+        let x = to_zwo(&w, &athlete());
+        assert!(x.contains("<Ramp Duration=\"240\" PowerLow=\"0.600\" PowerHigh=\"0.750\"/>"));
+        assert!(x.contains("<SteadyState Duration=\"300\" Power=\"0.530\"/>"));
+        assert!(x.contains("<Cooldown Duration=\"600\" PowerLow=\"0.600\" PowerHigh=\"0.400\"/>"));
     }
 }

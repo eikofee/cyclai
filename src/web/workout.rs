@@ -1,9 +1,9 @@
 use super::workout_chart::{chart_div, CHART_CSS, CHART_JS};
 use super::{escape_html, AppState};
 use crate::planned::Sport;
-use crate::workout::Athlete;
-use axum::extract::{Form, Path, State};
-use axum::response::{Html, Redirect};
+use crate::workout::{Athlete, Target, Workout, WorkoutStep};
+use axum::extract::{Form, Path, Query, State};
+use axum::response::{Html, IntoResponse, Redirect, Response};
 use serde::Deserialize;
 use serde_json::Value;
 use sqlx::SqlitePool;
@@ -28,7 +28,7 @@ pub async fn list(State(state): State<AppState>, axum::extract::Query(q): axum::
 
 async fn render_list_page(pool: &SqlitePool, error: Option<&str>, warn: Option<&str>) -> Html<String> {
     let rows: Vec<WorkoutRow> = sqlx::query_as(
-        "SELECT id, name, steps_json, source, created_at, sport FROM workouts ORDER BY created_at DESC",
+        "SELECT id, name, steps_json, source, created_at, sport FROM workouts WHERE category IS NULL ORDER BY created_at DESC",
     )
     .fetch_all(pool)
     .await
@@ -46,6 +46,7 @@ async fn render_list_page(pool: &SqlitePool, error: Option<&str>, warn: Option<&
         .unwrap_or_default();
     let create_form = builder_form_html("/workouts", None, &ath, &template_extra_fields(Sport::Cycling));
     let digest_html = super::digest_section(pool, warn).await;
+    let catalogue_html = catalogue_sections(pool, &ath).await;
 
     Html(page_shell(
         "Séances",
@@ -53,6 +54,7 @@ async fn render_list_page(pool: &SqlitePool, error: Option<&str>, warn: Option<&
             r#"{header}
 {digest_html}
 <section><h2>Mes séances</h2><ul class="workout-list">{items_html}</ul></section>
+{catalogue_html}
 <section><h2>Nouvelle séance</h2>{error_html}{create_form}</section>"#,
             header = super::layout::page_header("Séances", "Modèles réutilisables et concepteur d'échelons.", ""),
         ),
@@ -96,6 +98,9 @@ pub async fn edit_form(State(state): State<AppState>, Path(id): Path<i64>) -> Ht
         return Html("<p>Séance introuvable. <a href=\"/workouts\">Retour</a></p>".to_string());
     };
     let ath = fetch_athlete(&state.pool).await;
+    if is_catalogue(&state.pool, id).await {
+        return Html(render_readonly(id, &state.pool, &ath).await);
+    }
 
     let form = builder_form_html(&format!("/workouts/{id}"), Some(&row.steps_json), &ath, &template_extra_fields(Sport::from_db(&row.sport)));
     let delete_form = format!(
@@ -104,11 +109,7 @@ pub async fn edit_form(State(state): State<AppState>, Path(id): Path<i64>) -> Ht
 </form>"#
     );
 
-    let zwo_link = if Sport::from_db(&row.sport) == Sport::Cycling {
-        format!(r#"<p><a class="secondary-action" href="/workouts/{id}/zwo" download>Exporter pour Zwift (.zwo)</a></p>"#)
-    } else {
-        String::new()
-    };
+    let zwo_link = export_links_html(&format!("/workouts/{id}"), Sport::from_db(&row.sport));
 
     Html(page_shell(
         "Modifier la séance",
@@ -120,38 +121,414 @@ pub async fn edit_form(State(state): State<AppState>, Path(id): Path<i64>) -> Ht
     ))
 }
 
+/// Download links of a session: Zwift (cycling only) and Garmin FIT.
+fn export_links_html(base: &str, sport: Sport) -> String {
+    let zwo = if sport == Sport::Cycling {
+        format!(r#"<a class="secondary-action" href="{base}/zwo" download>Exporter pour Zwift (.zwo)</a> "#)
+    } else {
+        String::new()
+    };
+    format!(
+        r#"<p>{zwo}<a class="secondary-action" href="{base}/fit" download>Exporter pour Garmin (.fit, % FTP)</a>
+<a class="secondary-action" href="{base}/fit?mode=watts" download>Garmin (.fit, watts)</a></p>"#
+    )
+}
+
+/// Download name: ASCII letters, digits and dashes only.
+fn file_stem(name: &str) -> String {
+    name.chars().map(|c| if c.is_ascii_alphanumeric() || c == '-' { c } else { '_' }).collect()
+}
+
+fn download(content_type: &str, file_name: String, body: impl IntoResponse) -> Response {
+    use axum::http::header;
+    (
+        [
+            (header::CONTENT_TYPE, content_type.to_string()),
+            (header::CONTENT_DISPOSITION, format!("attachment; filename=\"{file_name}\"")),
+        ],
+        body,
+    )
+        .into_response()
+}
+
+async fn load_workout(pool: &SqlitePool, id: i64) -> Result<(Workout, Sport), axum::http::StatusCode> {
+    use axum::http::StatusCode;
+    let row: Option<(String, String, String)> = sqlx::query_as("SELECT name, steps_json, sport FROM workouts WHERE id = ?")
+        .bind(id)
+        .fetch_optional(pool)
+        .await
+        .ok()
+        .flatten();
+    let (name, steps_json, sport) = row.ok_or(StatusCode::NOT_FOUND)?;
+    let mut workout = serde_json::from_str::<Workout>(&steps_json).map_err(|_| StatusCode::UNPROCESSABLE_ENTITY)?;
+    if workout.name.trim().is_empty() {
+        workout.name = name;
+    }
+    Ok((workout, Sport::from_db(&sport)))
+}
+
 /// `GET /workouts/{id}/zwo` — the saved session as a Zwift workout file.
-pub async fn export_zwo(State(state): State<AppState>, Path(id): Path<i64>) -> axum::response::Response {
-    use axum::http::{header, StatusCode};
-    use axum::response::IntoResponse;
-    let row: Option<(String, String)> = sqlx::query_as("SELECT name, steps_json FROM workouts WHERE id = ?")
+pub async fn export_zwo(State(state): State<AppState>, Path(id): Path<i64>) -> Response {
+    let (workout, _) = match load_workout(&state.pool, id).await {
+        Ok(ok) => ok,
+        Err(status) => return status.into_response(),
+    };
+    let ath = fetch_athlete(&state.pool).await;
+    download(
+        "application/xml; charset=utf-8",
+        format!("{}.zwo", file_stem(&workout.name)),
+        crate::zwo::to_zwo(&workout, &ath),
+    )
+}
+
+#[derive(Deserialize)]
+pub struct FitQuery {
+    /// `watts` converts power targets with the app's FTP; default keeps % FTP.
+    mode: Option<String>,
+}
+
+pub(super) fn fit_response(workout: &Workout, sport: Sport, ath: &Athlete, q: &FitQuery) -> Response {
+    let mode = if q.mode.as_deref() == Some("watts") {
+        crate::garmin::Mode::Watts
+    } else {
+        crate::garmin::Mode::PercentFtp
+    };
+    download(
+        "application/octet-stream",
+        format!("{}.fit", file_stem(&workout.name)),
+        crate::garmin::to_fit(workout, ath, sport, mode),
+    )
+}
+
+/// `GET /workouts/{id}/fit` — the saved session as a Garmin FIT workout.
+pub async fn export_fit(State(state): State<AppState>, Path(id): Path<i64>, Query(q): Query<FitQuery>) -> Response {
+    let (workout, sport) = match load_workout(&state.pool, id).await {
+        Ok(ok) => ok,
+        Err(status) => return status.into_response(),
+    };
+    let ath = fetch_athlete(&state.pool).await;
+    fit_response(&workout, sport, &ath, &q)
+}
+
+#[derive(Deserialize)]
+pub struct PlanForm {
+    planned_date: String,
+}
+
+/// `POST /workouts/{id}/plan` — puts a copy of the session on the calendar.
+pub async fn plan(State(state): State<AppState>, Path(id): Path<i64>, Form(form): Form<PlanForm>) -> Response {
+    let row: Option<(String, String, String)> = sqlx::query_as("SELECT name, steps_json, sport FROM workouts WHERE id = ?")
         .bind(id)
         .fetch_optional(&state.pool)
         .await
         .ok()
         .flatten();
-    let Some((name, steps_json)) = row else {
-        return StatusCode::NOT_FOUND.into_response();
+    let (Some((name, steps_json, sport)), Some(date)) = (row, crate::planned::parse_date(&form.planned_date)) else {
+        return Redirect::to(&format!("/workouts/{id}")).into_response();
     };
-    let Ok(mut workout) = serde_json::from_str::<crate::workout::Workout>(&steps_json) else {
-        return StatusCode::UNPROCESSABLE_ENTITY.into_response();
-    };
-    if workout.name.trim().is_empty() {
-        workout.name = name.clone();
+    let prepared = crate::planned::Prepared { name, steps_json };
+    if let Err(err) =
+        crate::planned::insert(&state.pool, date, &prepared, None, Some(id), "manual", Sport::from_db(&sport)).await
+    {
+        tracing::error!(?err, "failed to schedule workout from the catalogue");
     }
-    let ath = fetch_athlete(&state.pool).await;
-    let file: String = name
-        .chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '-' { c } else { '_' })
-        .collect();
-    (
-        [
-            (header::CONTENT_TYPE, "application/xml; charset=utf-8".to_string()),
-            (header::CONTENT_DISPOSITION, format!("attachment; filename=\"{file}.zwo\"")),
-        ],
-        crate::zwo::to_zwo(&workout, &ath),
+    Redirect::to("/").into_response()
+}
+
+/// Sessions imported from a catalogue (e.g. Zwift) are read-only.
+async fn is_catalogue(pool: &SqlitePool, id: i64) -> bool {
+    sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM workouts WHERE id = ? AND category IS NOT NULL")
+        .bind(id)
+        .fetch_one(pool)
+        .await
+        .map(|n| n > 0)
+        .unwrap_or(false)
+}
+
+#[derive(sqlx::FromRow)]
+struct PlanSummary {
+    category: String,
+    group_key: String,
+    group_name: String,
+    sessions: i64,
+    weeks: i64,
+}
+
+/// One block per catalogue category ("Depuis Zwift · Collections"…) listing its plans or collections; a
+/// plan opens on its own page (`/workouts/plans/{key}`), organised by week.
+async fn catalogue_sections(pool: &SqlitePool, ath: &Athlete) -> String {
+    let plans: Vec<PlanSummary> = sqlx::query_as(
+        "SELECT category, group_key, MIN(group_name) AS group_name, COUNT(*) AS sessions, \
+                COUNT(DISTINCT subgroup) AS weeks \
+         FROM workouts WHERE category IS NOT NULL AND group_key IS NOT NULL \
+         GROUP BY category, group_key ORDER BY MIN(position)",
     )
-        .into_response()
+    .fetch_all(pool)
+    .await
+    .unwrap_or_default();
+
+    let mut html = String::new();
+    let mut i = 0;
+    while i < plans.len() {
+        let category = &plans[i].category;
+        let end = plans[i..].iter().position(|p| &p.category != category).map_or(plans.len(), |n| i + n);
+        let items: String = plans[i..end]
+            .iter()
+            .map(|p| {
+                format!(
+                    r#"<li class="workout-card"><div class="workout-card-head"><a href="/workouts/plans/{key}">{name}</a><span class="workout-source">{weeks}</span></div><div class="hint">{sessions} séances</div></li>"#,
+                    key = escape_html(&p.group_key),
+                    name = escape_html(&p.group_name),
+                    sessions = p.sessions,
+                    weeks = if p.weeks > 0 { format!("{} parties", p.weeks) } else { "séances libres".to_string() },
+                )
+            })
+            .collect();
+        html.push_str(&format!(
+            r#"<section><h2>{category}</h2><p class="hint">{n} groupes de séances en lecture seule, exprimés en % de FTP : les watts suivent la FTP des réglages ({ftp} W).</p><ul class="workout-list plan-list">{items}</ul></section>"#,
+            category = escape_html(category),
+            n = end - i,
+            ftp = ath.ftp_watts.round(),
+        ));
+        i = end;
+    }
+    html
+}
+
+#[derive(sqlx::FromRow)]
+struct CatalogueRow {
+    id: i64,
+    name: String,
+    steps_json: String,
+    subgroup: Option<String>,
+}
+
+/// `GET /workouts/plans/{key}` — a catalogue plan, its sessions grouped by week.
+pub async fn plan_page(State(state): State<AppState>, Path(key): Path<String>) -> Html<String> {
+    let ath = fetch_athlete(&state.pool).await;
+    let rows: Vec<CatalogueRow> = sqlx::query_as(
+        "SELECT id, name, steps_json, subgroup FROM workouts WHERE category IS NOT NULL AND group_key = ? ORDER BY position",
+    )
+    .bind(&key)
+    .fetch_all(&state.pool)
+    .await
+    .unwrap_or_default();
+    let meta: Option<(String, String)> = sqlx::query_as(
+        "SELECT group_name, category FROM workouts WHERE category IS NOT NULL AND group_key = ? LIMIT 1",
+    )
+    .bind(&key)
+    .fetch_optional(&state.pool)
+    .await
+    .ok()
+    .flatten();
+    let Some((plan, category)) = meta else {
+        return Html(page_shell("Plan", "<p>Plan introuvable. <a href=\"/workouts\">Retour</a></p>"));
+    };
+
+    let mut groups = String::new();
+    let mut total_min = 0.0;
+    let mut j = 0;
+    while j < rows.len() {
+        let week = rows[j].subgroup.clone().unwrap_or_default();
+        let end = rows[j..].iter().position(|r| r.subgroup.clone().unwrap_or_default() != week).map_or(rows.len(), |n| j + n);
+        let cards: String = rows[j..end].iter().map(|w| catalogue_card(w, &ath)).collect();
+        let week_min: f64 = rows[j..end]
+            .iter()
+            .filter_map(|w| serde_json::from_str::<Workout>(&w.steps_json).ok())
+            .map(|w| w.load_estimate(&ath).0)
+            .sum();
+        total_min += week_min;
+        let title = if week.is_empty() { plan.clone() } else { week };
+        groups.push_str(&format!(
+            r#"<details class="catalogue-group"{open}><summary>{title} <span class="hint">· {n} séances · {dur}</span></summary><ul class="workout-list">{cards}</ul></details>"#,
+            open = if j == 0 { " open" } else { "" },
+            title = escape_html(&title),
+            n = end - j,
+            dur = fmt_minutes(week_min),
+        ));
+        j = end;
+    }
+
+    Html(page_shell(
+        &plan,
+        &format!(
+            r#"<a class="back-link" href="/workouts">&larr; Retour aux séances</a>
+<section><h2>{plan}</h2><p class="hint">{category} · {n} séances · {dur} au total · lecture seule, en % de FTP (FTP actuelle {ftp} W)</p>{groups}</section>"#,
+            plan = escape_html(&plan),
+            category = escape_html(&category),
+            n = rows.len(),
+            dur = fmt_minutes(total_min),
+            ftp = ath.ftp_watts.round(),
+        ),
+    ))
+}
+
+fn catalogue_card(w: &CatalogueRow, ath: &Athlete) -> String {
+    let (minutes, tss) = serde_json::from_str::<Workout>(&w.steps_json)
+        .map(|wk| wk.load_estimate(ath))
+        .unwrap_or((0.0, 0.0));
+    format!(
+        r#"<li class="workout-card">
+<div class="workout-card-head"><a href="/workouts/{id}">{name}</a></div>
+{chart}
+<div class="hint">{dur} · TSS ≈ {tss:.0} · <a href="/workouts/{id}">Détail &amp; planification &rarr;</a></div>
+</li>"#,
+        id = w.id,
+        name = escape_html(&w.name),
+        chart = chart_div(&w.steps_json, ath),
+        dur = fmt_minutes(minutes),
+        tss = tss,
+    )
+}
+
+/// 54.2 -> "54 min", 75.0 -> "1h15".
+fn fmt_minutes(min: f64) -> String {
+    let total = min.round() as i64;
+    if total >= 60 {
+        format!("{}h{:02}", total / 60, total % 60)
+    } else {
+        format!("{total} min")
+    }
+}
+
+/// "6min" / "1min 50s" for a step duration.
+fn fmt_step_duration(min: f64) -> String {
+    let secs = (min * 60.0).round() as i64;
+    match (secs / 60, secs % 60) {
+        (0, s) => format!("{s} s"),
+        (m, 0) => format!("{m} min"),
+        (m, s) => format!("{m} min {s} s"),
+    }
+}
+
+/// Human description of a target, with the watts it comes to at the current FTP.
+fn describe_target(target: &Option<Target>, ath: &Athlete) -> String {
+    let w = |pct: f64| (pct / 100.0 * ath.ftp_watts).round();
+    match target {
+        None => "Libre".to_string(),
+        Some(Target::FtpPctRange { low, high }) if (low - high).abs() < f64::EPSILON => {
+            format!("{low:.0} % FTP · {} W", w(*low))
+        }
+        Some(Target::FtpPctRange { low, high }) => format!("{low:.0}–{high:.0} % FTP · {}–{} W", w(*low), w(*high)),
+        Some(Target::FtpRamp { from, to }) => format!("Rampe {from:.0} → {to:.0} % FTP · {} → {} W", w(*from), w(*to)),
+        Some(Target::PowerRange { low, high }) => format!("{low:.0}–{high:.0} W"),
+        Some(Target::PowerZone { zone }) => format!("Zone puissance {zone}"),
+        Some(Target::HrZone { zone }) => format!("Zone FC {zone}"),
+        Some(Target::HrRange { low, high }) => format!("{low:.0}–{high:.0} bpm"),
+        Some(Target::PaceRange { low, high }) => {
+            let f = |s: f64| format!("{}:{:02}", (s / 60.0).floor(), (s % 60.0).round());
+            format!("{}–{} /km", f(*low), f(*high))
+        }
+    }
+}
+
+fn steps_table_rows(steps: &[WorkoutStep], ath: &Athlete, depth: usize, out: &mut String) {
+    for step in steps {
+        let pad = format!("padding-left:{}rem", 0.5 + depth as f64 * 1.2);
+        match step {
+            WorkoutStep::Repeat { count, steps } => {
+                out.push_str(&format!(r#"<tr class="rep"><td colspan="3" style="{pad}">Répéter ×{count}</td></tr>"#));
+                steps_table_rows(steps, ath, depth + 1, out);
+            }
+            WorkoutStep::Warmup(s) | WorkoutStep::Interval(s) | WorkoutStep::Recovery(s) | WorkoutStep::Cooldown(s) => {
+                let label = match step {
+                    WorkoutStep::Warmup(_) => "Échauffement",
+                    WorkoutStep::Interval(_) => "Intervalle",
+                    WorkoutStep::Recovery(_) => "Récupération",
+                    _ => "Retour au calme",
+                };
+                out.push_str(&format!(
+                    r#"<tr><td style="{pad}">{label}</td><td>{dur}</td><td>{target}{note}</td></tr>"#,
+                    dur = fmt_step_duration(s.duration.minutes()),
+                    target = escape_html(&describe_target(&s.target, ath)),
+                    note = s
+                        .note
+                        .as_deref()
+                        .filter(|n| !n.trim().is_empty())
+                        .map(|n| format!(r#" <span class="hint">· {}</span>"#, escape_html(n)))
+                        .unwrap_or_default(),
+                ));
+            }
+        }
+    }
+}
+
+/// Read-only page of a catalogue session: profile, step list, plan + exports.
+async fn render_readonly(id: i64, pool: &SqlitePool, ath: &Athlete) -> String {
+    type Row = (String, String, String, Option<String>, Option<String>, Option<String>, Option<String>, Option<String>, Option<String>);
+    let row: Option<Row> = sqlx::query_as(
+        "SELECT name, steps_json, sport, category, description, source_url, group_key, group_name, subgroup          FROM workouts WHERE id = ?",
+    )
+    .bind(id)
+    .fetch_optional(pool)
+    .await
+    .ok()
+    .flatten();
+    let Some((name, steps_json, sport, category, description, source_url, group_key, group_name, subgroup)) = row else {
+        return page_shell("Séance", "<p>Séance introuvable. <a href=\"/workouts\">Retour</a></p>");
+    };
+    let workout = serde_json::from_str::<Workout>(&steps_json).ok();
+    let (minutes, tss) = workout.as_ref().map(|w| w.load_estimate(ath)).unwrap_or((0.0, 0.0));
+    let intensity = if minutes > 0.0 { (tss / (minutes / 60.0) / 100.0).sqrt() } else { 0.0 };
+    let mut rows = String::new();
+    if let Some(w) = &workout {
+        steps_table_rows(&w.steps, ath, 0, &mut rows);
+    }
+    let source = source_url
+        .map(|u| format!(r#" · <a href="{u}" target="_blank" rel="noopener">source</a>"#, u = escape_html(&u)))
+        .unwrap_or_default();
+    let description = description
+        .filter(|d| !d.trim().is_empty())
+        .map(|d| format!("<p>{}</p>", escape_html(&d)))
+        .unwrap_or_default();
+    let today = chrono::Utc::now().date_naive();
+    let back = match &group_key {
+        Some(key) => format!(
+            r#"<a class="back-link" href="/workouts/plans/{key}">&larr; Retour au plan {plan}</a>"#,
+            key = escape_html(key),
+            plan = escape_html(group_name.as_deref().unwrap_or("")),
+        ),
+        None => r#"<a class="back-link" href="/workouts">&larr; Retour aux séances</a>"#.to_string(),
+    };
+    let origin = [category.as_deref(), group_name.as_deref(), subgroup.as_deref()]
+        .into_iter()
+        .flatten()
+        .map(escape_html)
+        .collect::<Vec<_>>()
+        .join(" › ");
+
+    page_shell(
+        &name,
+        &format!(
+            r#"{back}
+<section>
+<h2>{name}</h2>
+<p class="hint">{origin} · lecture seule · FTP actuelle {ftp} W{source}</p>
+{description}
+{chart}
+<p class="workout-summary">Durée <strong>{dur}</strong> · TSS ≈ <strong>{tss:.0}</strong> · IF ≈ <strong>{intensity:.2}</strong></p>
+<table class="step-table"><thead><tr><th>Étape</th><th>Durée</th><th>Cible</th></tr></thead><tbody>{rows}</tbody></table>
+</section>
+<section>
+<h2>Planifier</h2>
+<form method="post" action="/workouts/{id}/plan" class="inline-form">
+<label>Date <input type="date" name="planned_date" value="{today}" required></label>
+<button type="submit">Ajouter au calendrier</button>
+<a class="secondary-action" href="/planned/new?from={id}">Modifier avant de planifier &rarr;</a>
+</form>
+</section>
+<section>
+<h2>Exporter</h2>
+{exports}
+<p class="hint">Garmin n'a pas de rampe : chaque rampe devient une plage de puissance cible (du point bas au point haut). En « % FTP », la montre applique sa propre FTP ; en « watts », la FTP de l'application.</p>
+</section>"#,
+            name = escape_html(&name),
+            ftp = ath.ftp_watts.round(),
+            chart = chart_div(&steps_json, ath),
+            dur = fmt_minutes(minutes),
+            exports = export_links_html(&format!("/workouts/{id}"), Sport::from_db(&sport)),
+        ),
+    )
 }
 
 #[derive(Deserialize)]
@@ -173,6 +550,11 @@ pub async fn update(State(state): State<AppState>, Path(id): Path<i64>, Form(for
 }
 
 async fn save(state: &AppState, id: Option<i64>, form: WorkoutForm) -> Html<String> {
+    if let Some(id) = id {
+        if is_catalogue(&state.pool, id).await {
+            return Html(render_readonly(id, &state.pool, &fetch_athlete(&state.pool).await).await);
+        }
+    }
     let ath = fetch_athlete(&state.pool).await;
     let sport = Sport::parse(&form.sport).unwrap_or_default();
 
@@ -252,6 +634,9 @@ fn error_page(id: Option<i64>, submitted_steps_json: &str, error: &str, ath: &At
 }
 
 pub async fn delete(State(state): State<AppState>, Path(id): Path<i64>) -> Redirect {
+    if is_catalogue(&state.pool, id).await {
+        return Redirect::to(&format!("/workouts/{id}"));
+    }
     let _ = sqlx::query("DELETE FROM workouts WHERE id = ?").bind(id).execute(&state.pool).await;
     Redirect::to("/workouts")
 }
@@ -414,11 +799,11 @@ const BUILDER_SCRIPT: &str = r####"<script>
     }).join('');
   }
 
-  var KIND_LABELS = {power_range: 'Puissance (W)', power_zone: 'Zone puissance', pace_range: 'Allure (min/km)', hr_range: 'FC (bpm)', hr_zone: 'Zone FC'};
+  var KIND_LABELS = {ftp_pct_range: '% FTP', ftp_ramp: 'Rampe % FTP', power_range: 'Puissance (W)', power_zone: 'Zone puissance', pace_range: 'Allure (min/km)', hr_range: 'FC (bpm)', hr_zone: 'Zone FC'};
   var KINDS_BY_SPORT = {
-    cycling: ['power_range', 'power_zone', 'hr_range', 'hr_zone'],
+    cycling: ['power_range', 'ftp_pct_range', 'ftp_ramp', 'power_zone', 'hr_range', 'hr_zone'],
     running: ['pace_range', 'hr_range', 'hr_zone'],
-    other: ['power_range', 'power_zone', 'pace_range', 'hr_range', 'hr_zone']
+    other: ['power_range', 'ftp_pct_range', 'ftp_ramp', 'power_zone', 'pace_range', 'hr_range', 'hr_zone']
   };
   // Target kinds offered for the current sport (a step keeps its own kind
   // even if the sport changed afterwards).
@@ -446,6 +831,8 @@ const BUILDER_SCRIPT: &str = r####"<script>
     if (t.type === 'pace_range') {
       return HR.runPace > 0 ? Math.round(HR.runPace / ((lo + hi) / 2 || 1) * 100) + ' % allure seuil' : 'allure seuil non réglée';
     }
+    if (t.type === 'ftp_pct_range') return Math.round(lo / 100 * FTP) + (lo !== hi ? '–' + Math.round(hi / 100 * FTP) : '') + ' W';
+    if (t.type === 'ftp_ramp') return Math.round(num(t.from) / 100 * FTP) + ' → ' + Math.round(num(t.to) / 100 * FTP) + ' W';
     return Math.round(lo / FTP * 100) + (lo !== hi ? '–' + Math.round(hi / FTP * 100) : '') + ' % FTP';
   }
   function stepColor(step) {
@@ -464,7 +851,11 @@ const BUILDER_SCRIPT: &str = r####"<script>
     var hrZone = cur === 'hr_zone' ? step.target.zone
       : cur === 'hr_range' ? window.workoutHrZoneOf((num(step.target.low) + num(step.target.high)) / 2, HR)
       : (f < 0.58 ? 1 : f < 0.75 ? 2 : f < 0.90 ? 3 : f < 1.03 ? 4 : 5);
-    if (kind === 'power_range') {
+    if (kind === 'ftp_pct_range') {
+      step.target = {type: 'ftp_pct_range', low: Math.round(Math.max(40, f * 100 - 5)), high: Math.round(f * 100 + 5)};
+    } else if (kind === 'ftp_ramp') {
+      step.target = {type: 'ftp_ramp', from: Math.round(Math.max(40, f * 100 - 10)), to: Math.round(f * 100 + 10)};
+    } else if (kind === 'power_range') {
       step.target = {type: 'power_range', low: Math.round(FTP * Math.max(0.4, f - 0.05)), high: Math.round(FTP * (f + 0.05))};
     } else if (kind === 'power_zone') {
       step.target = {type: 'power_zone', zone: window.workoutPowerZoneOf(f)};
@@ -504,7 +895,14 @@ const BUILDER_SCRIPT: &str = r####"<script>
         '<input data-f="phigh" type="text" class="in-pace" value="' + window.workoutFmtPace(num(t.high)) + '" placeholder="5:30" aria-label="Allure la plus lente">' +
         '<span>/km</span>';
     }
-    var unit = t.type === 'hr_range' ? 'bpm' : 'W';
+    if (t.type === 'ftp_ramp') {
+      return kindSelect +
+        '<input data-f="from" type="number" min="0" class="in-pw" value="' + esc(t.from) + '" aria-label="Début de rampe (% FTP)">' +
+        '<span>&rarr;</span>' +
+        '<input data-f="to" type="number" min="0" class="in-pw" value="' + esc(t.to) + '" aria-label="Fin de rampe (% FTP)">' +
+        '<span>% FTP</span>';
+    }
+    var unit = t.type === 'hr_range' ? 'bpm' : t.type === 'ftp_pct_range' ? '% FTP' : 'W';
     return kindSelect +
       '<input data-f="low" type="number" min="0" class="in-pw" value="' + esc(t.low) + '" aria-label="Cible basse">' +
       '<span>&ndash;</span>' +
@@ -590,6 +988,8 @@ const BUILDER_SCRIPT: &str = r####"<script>
     else if (field === 'phigh') step.target.high = window.workoutParsePace(v);
     else if (field === 'low') step.target.low = num(v);
     else if (field === 'high') step.target.high = num(v);
+    else if (field === 'from') step.target.from = num(v);
+    else if (field === 'to') step.target.to = num(v);
     else if (field === 'terrain') step.terrain = v;
     else if (field === 'note') step.note = v;
     else if (field === 'count') step.count = Math.max(1, parseInt(v, 10) || 1);
@@ -646,6 +1046,15 @@ const BUILDER_CSS: &str = r#"
 .workout-card-head a { font-weight: 600; color: var(--text); text-decoration: none; }
 .workout-card-head a:hover { color: var(--accent); }
 .workout-source { font-size: 0.75rem; color: var(--text-muted); background: var(--bg); border-radius: 999px; padding: 0.1rem 0.6rem; white-space: nowrap; }
+.plan-list { display: grid; grid-template-columns: repeat(auto-fill, minmax(14rem, 1fr)); }
+.catalogue-group { margin-bottom: 0.6rem; }
+.catalogue-group > summary { cursor: pointer; font-weight: 600; padding: 0.4rem 0; }
+.catalogue-group > .workout-list { margin-top: 0.4rem; }
+.step-table { width: 100%; border-collapse: collapse; font-size: 0.85rem; margin: 0.6rem 0; }
+.step-table th, .step-table td { text-align: left; padding: 0.3rem 0.5rem; border-bottom: 1px solid var(--border); }
+.step-table th { color: var(--text-muted); font-weight: 600; }
+.step-table tr.rep td { font-weight: 600; background: var(--bg); }
+.inline-form { display: flex; flex-wrap: wrap; align-items: end; gap: 0.8rem; }
 .workout-preview { margin: 0.8rem 0 0.2rem; border: 1px solid var(--border); border-radius: 8px; padding: 0.4rem 0.6rem; background: var(--card-bg); }
 .workout-summary { font-size: 0.85rem; color: var(--text-muted); margin: 0.2rem 0 0.9rem; min-height: 1.2em; }
 .workout-summary strong { color: var(--text); }

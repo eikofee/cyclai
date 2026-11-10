@@ -10,6 +10,8 @@ mod segments;
 mod settings;
 mod stats;
 mod workout;
+mod mcp;
+mod oauth;
 mod workout_chart;
 
 use axum::extract::{Form, State};
@@ -48,18 +50,24 @@ pub async fn serve(pool: SqlitePool, bind: &str) -> anyhow::Result<()> {
         .route("/activity/{id}/report", post(detail::activity_report))
         .route("/activity/{id}/description", post(detail::update_description))
         .route("/workouts", get(workout::list).post(workout::create))
+        .route("/workouts/plans/{key}", get(workout::plan_page))
         .route("/workouts/{id}", get(workout::edit_form).post(workout::update))
         .route("/workouts/{id}/delete", post(workout::delete))
         .route("/workouts/{id}/zwo", get(workout::export_zwo))
+        .route("/workouts/{id}/fit", get(workout::export_fit))
+        .route("/workouts/{id}/plan", post(workout::plan))
         .route("/planned/new", get(planned::new_form))
         .route("/planned", post(planned::create))
         .route("/planned/{id}", get(planned::edit_form).post(planned::update))
         .route("/planned/{id}/delete", post(planned::delete))
+        .route("/planned/{id}/status", post(planned::set_status))
+        .route("/planned/{id}/fit", get(planned::export_fit))
         .route("/digest", post(trigger_digest))
         .route("/digest/report", post(digest_report))
         .route("/sync", post(trigger_sync))
         .route("/sync/full", post(trigger_full_sync))
         .route("/sync/status", get(sync_status))
+        .route("/coach-note/clear", post(clear_coach_note))
         .route("/import", post(import::import_activity))
         .route("/route", get(route::page).post(route::analyze))
         .route("/stats", get(stats::page))
@@ -71,6 +79,10 @@ pub async fn serve(pool: SqlitePool, bind: &str) -> anyhow::Result<()> {
         .route("/settings/prompts/bilan", post(settings::update_bilan_prompt))
         .route("/settings/prompts/digest", post(settings::update_digest_prompt))
         .route("/settings/athlete", post(settings::update_athlete_config))
+        .route("/settings/rules", post(settings::update_rules))
+        .route("/settings/availability", post(settings::update_availability))
+        .route("/settings/availability/exception", post(settings::add_availability_exception))
+        .route("/settings/availability/delete", post(settings::delete_availability_exception))
         .route("/settings/appearance", post(settings::update_appearance))
         // Planned-route GPX and FIT/GPX activity uploads can exceed axum's 2 MB default.
         .layer(axum::extract::DefaultBodyLimit::max(25 * 1024 * 1024))
@@ -114,7 +126,10 @@ pub async fn serve_api(pool: SqlitePool, bind: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn api_router(state: AppState) -> Router {
+/// Every `/api/v1` route, with no authentication: the exposed router wraps it
+/// with the bearer guard, and MCP tools call it in-process after their own
+/// authentication and scope checks.
+fn api_routes() -> Router<AppState> {
     Router::new()
         .route("/api/v1/profile", get(api::profile))
         .route("/api/v1/load", get(api::load))
@@ -123,11 +138,35 @@ fn api_router(state: AppState) -> Router {
         .route("/api/v1/activities/{id}", get(api::activity))
         .route("/api/v1/activities/{id}/streams", get(api::activity_streams))
         .route("/api/v1/workouts", get(api::workouts))
+        .route("/api/v1/workouts/categories", get(api::workout_categories))
+        .route("/api/v1/workouts/{id}", get(api::workout))
+        .route("/api/v1/proposals", post(api::proposal_create))
+        .route("/api/v1/planned/{id}/skip", post(api::planned_skip))
+        .route("/api/v1/rules", get(api::rules))
+        .route("/api/v1/projection", post(api::projection))
+        .route("/api/v1/ride-envelope", get(api::ride_envelope))
+        .route("/api/v1/availability",get(api::availability_get).put(api::availability_put))
+        .route("/api/v1/checkins", get(api::checkins))
+        .route("/api/v1/checkins/{date}", axum::routing::put(api::checkin_put))
+        .route("/api/v1/coach-note", get(api::coach_note_get).put(api::coach_note_put))
         .route("/api/v1/planned", get(api::planned_list).post(api::planned_create))
         .route("/api/v1/planned/{id}", axum::routing::delete(api::planned_delete))
-        // `layer` (not `route_layer`): unknown paths answer 401 too, so the
-        // exposed process reveals nothing about what it does or doesn't serve.
-        .layer(axum::middleware::from_fn_with_state(state.clone(), auth::require_api_key))
+}
+
+fn api_router(state: AppState) -> Router {
+    // `layer` (not `route_layer`): unknown paths answer 401 too, so the
+    // exposed process reveals nothing about what it does or doesn't serve.
+    let guarded = api_routes().layer(axum::middleware::from_fn_with_state(state.clone(), auth::require_api_key));
+    Router::new()
+        .route("/mcp", post(mcp::endpoint).get(mcp::method_not_allowed).delete(mcp::method_not_allowed))
+        // OAuth 2.1 for the MCP connector: discovery, registration, consent, tokens.
+        .route("/.well-known/oauth-protected-resource", get(oauth::protected_resource))
+        .route("/.well-known/oauth-protected-resource/mcp", get(oauth::protected_resource))
+        .route("/.well-known/oauth-authorization-server", get(oauth::authorization_server))
+        .route("/oauth/register", post(oauth::register))
+        .route("/oauth/authorize", get(oauth::authorize_get).post(oauth::authorize_post))
+        .route("/oauth/token", post(oauth::token))
+        .merge(guarded)
         .with_state(state)
 }
 
@@ -248,18 +287,24 @@ struct CalendarPlanned {
     intensity: f64,
     /// An activity already exists on that day.
     done: bool,
+    /// Suggested by an agent, waiting for the user's confirmation.
+    proposed: bool,
 }
 
 async fn fetch_calendar_planned(pool: &SqlitePool, ath: &crate::workout::Athlete) -> anyhow::Result<Vec<CalendarPlanned>> {
-    let start = calendar_window_start(chrono::Utc::now().date_naive());
+    let today = chrono::Utc::now().date_naive();
+    crate::planned::reconcile(pool, today).await?;
+    let start = calendar_window_start(today);
     let end = start + chrono::Duration::weeks(CALENDAR_WEEKS_SPAN);
     let planned = crate::planned::list_between(pool, start, end).await?;
 
     let mut out = Vec::with_capacity(planned.len());
     for p in planned {
-        let (minutes, tss) = serde_json::from_str::<crate::workout::Workout>(&p.steps_json)
-            .map(|w| w.load_estimate(ath))
-            .unwrap_or((0.0, 0.0));
+        // Skipped and rejected sessions leave the calendar (they stay in the DB).
+        if matches!(p.status.as_str(), "skipped" | "rejected") {
+            continue;
+        }
+        let (minutes, tss) = p.load_estimate(ath);
         let intensity = if minutes > 0.0 { (tss / (minutes / 60.0) / 100.0).sqrt() } else { 0.0 };
         let (done,): (bool,) = sqlx::query_as(
             "SELECT EXISTS(SELECT 1 FROM activities WHERE started_at >= ?1 AND started_at < date(?1, '+1 day'))",
@@ -275,6 +320,7 @@ async fn fetch_calendar_planned(pool: &SqlitePool, ath: &crate::workout::Athlete
             minutes,
             intensity,
             done,
+            proposed: p.status == "proposed",
         });
     }
     Ok(out)
@@ -329,10 +375,10 @@ fn render_calendar_html(activities: &[CalendarActivity], planned: &[CalendarPlan
         // Outlined + tinted rather than solid, so a plan reads as "not done
         // yet" next to the solid completed rides.
         serde_json::json!({
-            "title": format!("{}{} {} · {}", if p.done { "✓ " } else { "" }, p.sport.icon(), p.name, format_duration_hms((p.minutes * 60.0).round() as i64)),
+            "title": format!("{}{}{} {} · {}", if p.proposed { "? " } else { "" }, if p.done { "✓ " } else { "" }, p.sport.icon(), p.name, format_duration_hms((p.minutes * 60.0).round() as i64)),
             // Compact chip in the cell (the full name goes in the tooltip).
             "extendedProps": {
-                "l1": format!("{}{} {}", if p.done { "✓ " } else { "" }, p.sport.icon(), format_duration_hms((p.minutes * 60.0).round() as i64)),
+                "l1": format!("{}{}{} {}", if p.proposed { "? " } else { "" }, if p.done { "✓ " } else { "" }, p.sport.icon(), format_duration_hms((p.minutes * 60.0).round() as i64)),
                 "l2": "",
             },
             "start": p.date,
@@ -341,7 +387,7 @@ fn render_calendar_html(activities: &[CalendarActivity], planned: &[CalendarPlan
             "backgroundColor": format!("{color}22"),
             "borderColor": color,
             "textColor": "var(--text)",
-            "classNames": ["planned-event"],
+            "classNames": if p.proposed { vec!["planned-event", "proposed-event"] } else { vec!["planned-event"] },
         })
     });
 
@@ -1000,6 +1046,7 @@ fn render_page(
     calendar_activities: &[CalendarActivity],
     calendar_planned: &[CalendarPlanned],
     load_chart_json: &str,
+    coach_note_html: &str,
 ) -> String {
     let zone_bar_html = render_zone_bar(&load.zone_secs, config.ftp_watts as f64);
     let tsb_gauge_html = render_tsb_gauge(load.tsb, load.rest_days_to_next_band);
@@ -1017,6 +1064,7 @@ fn render_page(
 
     let body = format!(
         r#"{header}
+{coach_note_html}
 <div id="sync-status" class="sync-status" hidden></div>
 <script>{sync_status_js}</script>
 <div class="dash-grid">
@@ -1070,7 +1118,7 @@ document.querySelectorAll('.activity-body .bilan:not(.pending)').forEach(functio
     );
 
     layout::Page::new("", layout::Nav::Home, &body)
-        .css(&format!("{}{}", workout_chart::CHART_CSS, SYNC_STATUS_CSS))
+        .css(&format!("{}{}{}", workout_chart::CHART_CSS, SYNC_STATUS_CSS, COACH_NOTE_CSS))
         .head(&format!(r#"<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.4/dist/chart.umd.min.js"></script>{}"#, workout_chart::CHART_JS))
         .render()
 }
@@ -1171,6 +1219,7 @@ async fn dashboard(State(state): State<AppState>) -> Html<String> {
         &calendar_activities,
         &calendar_planned,
         &load_chart_json(&state.pool).await,
+        &coach_note_html(&state.pool).await,
     ))
 }
 
@@ -1250,6 +1299,41 @@ async fn trigger_full_sync(State(state): State<AppState>) -> Redirect {
     crate::sync::spawn(state.pool.clone(), true);
     Redirect::to("/")
 }
+
+async fn clear_coach_note(State(state): State<AppState>) -> Redirect {
+    if let Err(err) = sqlx::query("DELETE FROM coach_note WHERE id = 1").execute(&state.pool).await {
+        tracing::error!(?err, "failed to clear coach note");
+    }
+    Redirect::to("/")
+}
+
+/// Banner with the agent's message of the day, or nothing when there is none.
+async fn coach_note_html(pool: &SqlitePool) -> String {
+    let row: Option<(String, Option<String>, String)> =
+        sqlx::query_as("SELECT message, author, updated_at FROM coach_note WHERE id = 1")
+            .fetch_optional(pool)
+            .await
+            .unwrap_or(None);
+    let Some((message, author, updated_at)) = row else {
+        return String::new();
+    };
+    let meta = match author {
+        Some(a) => format!("{} · {}", escape_html(&a), escape_html(&updated_at)),
+        None => escape_html(&updated_at),
+    };
+    format!(
+        r#"<aside class="coach-note"><div>{}</div><div class="coach-note-meta">{meta}<form method="post" action="/coach-note/clear"><button type="submit" class="secondary" title="Masquer ce message">Effacer</button></form></div></aside>"#,
+        escape_html(&message).replace('\n', "<br>"),
+    )
+}
+
+const COACH_NOTE_CSS: &str = r#"
+.coach-note { margin: 0 0 1rem; padding: .8rem 1rem; border-radius: 8px; border-left: 4px solid currentColor; background: rgba(127,127,127,.12); }
+.proposed-event { border-style: dashed !important; }
+.coach-note-meta { display: flex; gap: .6rem; align-items: center; margin-top: .4rem; font-size: .8rem; opacity: .7; }
+.coach-note-meta form { margin: 0; }
+.coach-note-meta button { padding: .1rem .5rem; font-size: .8rem; }
+"#;
 
 async fn sync_status() -> axum::Json<crate::sync::Progress> {
     axum::Json(crate::sync::progress())
