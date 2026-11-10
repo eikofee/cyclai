@@ -442,6 +442,7 @@ fn planned_json(p: &crate::planned::Planned, ath: &crate::workout::Athlete) -> V
         "estimated_tss": round(tss, 0),
         "estimated_if": crate::rules::intensity_factor(minutes, tss).map(|f| round(f, 2)),
         "estimated_distance_km": workout.get("estimated_distance_km"),
+        "structure_summary": serde_json::from_value::<crate::workout::Workout>(workout.clone()).ok().map(|w| w.structure_summary()),
         "workout": workout,
     })
 }
@@ -1106,6 +1107,7 @@ fn workout_json(row: WorkoutRow, ath: &crate::workout::Athlete, with_steps: bool
         "intensity_factor": round(intensity_factor, 2),
         "power_zone_minutes": zones.iter().map(|m| round(*m, 1)).collect::<Vec<_>>(),
         "tags": tags,
+        "structure_summary": parsed.as_ref().map(|w| w.structure_summary()),
         "estimated_distance_km": workout.get("estimated_distance_km"),
         "computed_at_ftp_w": ath.ftp_watts,
     });

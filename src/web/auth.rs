@@ -406,6 +406,7 @@ mod tests {
         assert_eq!(one["power_zone_minutes"][3], 40.0, "{one}");
         assert!(one["tags"].as_array().unwrap().iter().any(|t| t == "seuil"));
         assert_eq!(one["plan"]["group_name"], "Plan A");
+        assert!(one["structure_summary"].as_str().unwrap().contains("@100%"), "{one}");
         assert!(one["intensity_factor"].as_f64().unwrap() > 0.7);
         assert!(one["workout"]["steps"].is_array());
 

@@ -167,6 +167,12 @@ impl Workout {
         zones
     }
 
+    /// One readable line of the structure, e.g.
+    /// `10 min @55% · 2×(20 min @100% / 5 min @50%) · 10 min @55%`.
+    pub fn structure_summary(&self) -> String {
+        steps_summary(&self.steps, " · ")
+    }
+
     /// Minimal sanity checks — not a full training-science validator.
     /// Duration strings that fail to parse come back as 0 minutes, so 0 is
     /// treated as "didn't parse". Returns a user-facing (French) message.
@@ -213,6 +219,47 @@ fn steps_run_distance_km(steps: &[WorkoutStep], a: &Athlete) -> Option<f64> {
         }
     }
     Some(total)
+}
+
+fn format_minutes(m: f64) -> String {
+    if m < 1.0 {
+        format!("{:.0} s", m * 60.0)
+    } else if (m - m.round()).abs() < 0.05 {
+        format!("{:.0} min", m)
+    } else {
+        format!("{:.1} min", m)
+    }
+}
+
+fn target_summary(t: &Target) -> String {
+    let pct = |v: f64| format!("{v:.0}");
+    match t {
+        Target::FtpPctRange { low, high } if (low - high).abs() < 0.5 => format!("@{}%", pct(*low)),
+        Target::FtpPctRange { low, high } => format!("@{}-{}%", pct(*low), pct(*high)),
+        Target::FtpRamp { from, to } => format!("@{}→{}%", pct(*from), pct(*to)),
+        Target::PowerRange { low, high } => format!("@{}-{} W", pct(*low), pct(*high)),
+        Target::PowerZone { zone } => format!("Z{zone}"),
+        Target::HrZone { zone } => format!("FC Z{zone}"),
+        Target::HrRange { low, high } => format!("FC {}-{}", pct(*low), pct(*high)),
+        Target::PaceRange { .. } => "allure".to_string(),
+    }
+}
+
+fn steps_summary(steps: &[WorkoutStep], sep: &str) -> String {
+    steps
+        .iter()
+        .map(|step| match step {
+            WorkoutStep::Repeat { count, steps } => format!("{count}×({})", steps_summary(steps, " / ")),
+            WorkoutStep::Warmup(s) | WorkoutStep::Interval(s) | WorkoutStep::Recovery(s) | WorkoutStep::Cooldown(s) => {
+                let d = format_minutes(s.duration.minutes());
+                match &s.target {
+                    Some(t) => format!("{d} {}", target_summary(t)),
+                    None => d,
+                }
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(sep)
 }
 
 /// Zone (0-based) of an intensity expressed as a fraction of FTP — same

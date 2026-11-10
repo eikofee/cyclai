@@ -279,12 +279,56 @@ fn free_ride_page(p: &crate::planned::Planned, id: i64, banner: &str) -> Html<St
     ))
 }
 
+/// What was picked, at a glance: the session's exact name, the plan it comes
+/// from, duration / TSS / IF at the current FTP and a readable structure line.
+/// Empty for sessions with no steps (free rides) or no readable structure.
+async fn selection_card(pool: &sqlx::SqlitePool, p: &crate::planned::Planned, ath: &Athlete) -> String {
+    let Ok(workout) = serde_json::from_str::<crate::workout::Workout>(&p.steps_json) else {
+        return String::new();
+    };
+    let (minutes, tss) = workout.load_estimate(ath);
+    let if_ = crate::workout::intensity_factor(minutes, tss);
+    // Origin of the template, if it still exists.
+    let origin: Option<(i64, Option<String>, Option<String>, Option<String>)> = match p.workout_id {
+        Some(wid) => sqlx::query_as("SELECT id, category, group_name, subgroup FROM workouts WHERE id = ?")
+            .bind(wid)
+            .fetch_optional(pool)
+            .await
+            .ok()
+            .flatten(),
+        None => None,
+    };
+    let plan = origin
+        .as_ref()
+        .map(|(_, c, g, s)| [c, g, s].into_iter().flatten().filter(|v| !v.is_empty()).map(|v| escape_html(v)).collect::<Vec<_>>().join(" › "))
+        .filter(|s| !s.is_empty())
+        .map(|s| format!("<div>Plan d'origine : <strong>{s}</strong></div>"))
+        .unwrap_or_default();
+    let name = match &origin {
+        Some((id, ..)) => format!(r#"<a href="/workouts/{id}">{}</a>"#, escape_html(&p.name)),
+        None => escape_html(&p.name),
+    };
+    format!(
+        r#"<div style="margin:0 0 1rem;padding:.8rem 1rem;border-radius:8px;background:rgba(127,127,127,.08)">
+<div style="font-size:1.05rem"><strong>{name}</strong></div>{plan}
+<div>{dur} · TSS ≈ {tss:.0} · IF ≈ {if_:.2} <span class="hint">(au FTP actuel : {ftp:.0} W)</span></div>
+<div class="hint">{summary}</div></div>"#,
+        dur = crate::web::format::format_duration_hms((minutes * 60.0).round() as i64),
+        ftp = ath.ftp_watts,
+        summary = escape_html(&workout.structure_summary()),
+    )
+}
+
 pub async fn edit_form(State(state): State<AppState>, Path(id): Path<i64>) -> Response {
     let ath = fetch_athlete(&state.pool).await;
     let Ok(Some(p)) = crate::planned::get(&state.pool, id).await else {
         return Html("<p>Séance planifiée introuvable. <a href=\"/\">Retour</a></p>".to_string()).into_response();
     };
-    let banner = status_banner(&p, id);
+    let mut banner = status_banner(&p, id);
+    if !p.is_free_ride() && (p.status != "planned" || p.workout_id.is_some()) {
+        // Sessions an agent put there (or answered to) show what was picked.
+        banner = format!("{}{banner}", selection_card(&state.pool, &p, &ath).await);
+    }
     if p.is_free_ride() {
         return free_ride_page(&p, id, &banner).into_response();
     }
@@ -353,4 +397,40 @@ pub async fn export_fit(State(state): State<AppState>, Path(id): Path<i64>, Quer
     };
     let ath = fetch_athlete(&state.pool).await;
     fit_response(&workout, Sport::from_db(&p.sport), &ath, &q)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sqlx::sqlite::SqlitePoolOptions;
+
+    #[tokio::test]
+    async fn selection_card_shows_exact_name_plan_figures_and_structure() {
+        let pool = SqlitePoolOptions::new().connect("sqlite::memory:").await.unwrap();
+        crate::db::migrate(&pool).await.unwrap();
+        let steps = r#"{"name":"Over-Unders","steps":[
+            {"type":"warmup","duration":{"type":"time","value":"10min"},"target":{"type":"ftp_pct_range","low":55,"high":55}},
+            {"type":"repeat","count":2,"steps":[
+              {"type":"interval","duration":{"type":"time","value":"20min"},"target":{"type":"ftp_pct_range","low":100,"high":100}},
+              {"type":"recovery","duration":{"type":"time","value":"5min"},"target":{"type":"ftp_pct_range","low":50,"high":50}}]},
+            {"type":"cooldown","duration":{"type":"time","value":"10min"},"target":{"type":"ftp_ramp","from":60,"to":40}}]}"#;
+        sqlx::query("INSERT INTO workouts (id, name, steps_json, category, group_key, group_name, subgroup) VALUES (7, 'Over-Unders', ?, 'Depuis Zwift', 'ftp-builder', 'FTP Builder', 'Semaine 3')")
+            .bind(steps).execute(&pool).await.unwrap();
+        sqlx::query("INSERT INTO planned_workouts (id, planned_date, name, steps_json, workout_id, status, rationale) VALUES (1, '2026-11-12', 'Over-Unders', ?, 7, 'proposed', 'seuil')")
+            .bind(steps).execute(&pool).await.unwrap();
+        let ath = Athlete { ftp_watts: 205.0, hr_rest: 50.0, hr_max: 190.0, run_threshold_pace_s: 0.0 };
+        let p = crate::planned::get(&pool, 1).await.unwrap().unwrap();
+
+        let card = selection_card(&pool, &p, &ath).await;
+        assert!(card.contains("Over-Unders") && card.contains(r#"href="/workouts/7""#), "{card}");
+        assert!(card.contains("Depuis Zwift › FTP Builder › Semaine 3"), "{card}");
+        assert!(card.contains("1:") || card.contains("1h"), "duration: {card}");
+        assert!(card.contains("IF ≈") && card.contains("205 W"), "{card}");
+        assert!(card.contains("10 min @55% · 2×(20 min @100% / 5 min @50%) · 10 min @60→40%"), "{card}");
+
+        // A session with no readable steps shows nothing rather than a broken card.
+        let mut broken = p;
+        broken.steps_json = "not json".into();
+        assert_eq!(selection_card(&pool, &broken, &ath).await, "");
+    }
 }
