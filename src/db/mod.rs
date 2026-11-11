@@ -96,7 +96,7 @@ mod tests {
         for col in ["max_ctl_ramp_per_week", "min_tsb", "intense_if", "intense_tss", "max_consecutive_intense", "min_rest_days_per_week"] {
             sqlx::query(&format!("ALTER TABLE athlete_config DROP COLUMN {col}")).execute(&pool).await.unwrap();
         }
-        for col in ["status", "rationale", "idempotency_key", "kind", "budget_tss_min", "budget_tss_max", "budget_duration_max_min", "intent", "activity_id"] {
+        for col in ["status", "rationale", "idempotency_key", "kind", "budget_tss_min", "budget_tss_max", "budget_duration_max_min", "intent", "activity_id", "alternatives_json"] {
             sqlx::query(&format!("ALTER TABLE planned_workouts DROP COLUMN {col}")).execute(&pool).await.unwrap();
         }
         sqlx::query("DROP INDEX idx_workouts_group").execute(&pool).await.unwrap();
@@ -125,7 +125,7 @@ mod tests {
 
         migrate(&pool).await.unwrap();
         let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM _sqlx_migrations").fetch_one(&pool).await.unwrap();
-        assert_eq!(n, 10); // initial (adopted) + the nine later migrations (applied after)
+        assert_eq!(n, 11); // initial (adopted) + the ten later migrations (applied after)
         migrate(&pool).await.unwrap(); // idempotent
     }
 

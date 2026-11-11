@@ -464,6 +464,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn proposals_can_offer_checked_alternatives() {
+        let pool = SqlitePoolOptions::new().connect("sqlite::memory:").await.unwrap();
+        crate::db::migrate(&pool).await.unwrap();
+        crate::db::seed_athlete_config(&pool, &test_config()).await.unwrap();
+        add(&pool, "k", PUBLIC, Scope::Write).await.unwrap();
+        let day = (chrono::Utc::now() - chrono::Duration::days(10)).format("%Y-%m-%dT08:00:00Z").to_string();
+        sqlx::query("INSERT INTO activities (id, started_at, duration_s, distance_m, elevation_gain_m, tss, intensity_factor) VALUES (1, ?, 3600, 30000, 100, 60, 0.7)")
+            .bind(day).execute(&pool).await.unwrap();
+        crate::metrics::recompute_daily_load(&pool).await.unwrap();
+        let steps = |pct: u32| format!(r#"{{"name":"S{pct}","steps":[{{"type":"interval","duration":{{"type":"time","value":"60min"}},"target":{{"type":"ftp_pct_range","low":{pct},"high":{pct}}}}}]}}"#);
+        // 1 and 2: easy options. 3: a monster (3 h at 110 %) that no rule allows.
+        let monster = r#"{"name":"Monster","steps":[{"type":"interval","duration":{"type":"time","value":"180min"},"target":{"type":"ftp_pct_range","low":110,"high":110}}]}"#;
+        for (id, s) in [(1, steps(65)), (2, steps(55)), (3, monster.to_string())] {
+            sqlx::query("INSERT INTO workouts (id, name, steps_json) VALUES (?, ?, ?)").bind(id).bind(format!("W{id}")).bind(s).execute(&pool).await.unwrap();
+        }
+        let app = api_router(AppState { pool: pool.clone() });
+        let token = mint_token(PRIVATE, "k", 60).unwrap();
+        let tomorrow = (chrono::Utc::now().date_naive() + chrono::Duration::days(1)).to_string();
+        let propose = |extra: serde_json::Value| {
+            let mut body = serde_json::json!({"date": tomorrow, "workout_id": 1, "rationale": "r"});
+            body.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+            let (app, token) = (app.clone(), token.clone());
+            async move { call(&app, "POST", "/api/v1/proposals", &token, Some(&body.to_string())).await }
+        };
+
+        let (s, ok) = propose(serde_json::json!({"alternatives": [{"workout_id": 2, "note": "plus doux"}]})).await;
+        assert_eq!(s, StatusCode::CREATED, "{ok}");
+        assert_eq!(ok["alternatives"][0]["workout_id"], 2);
+        assert_eq!(ok["alternatives"][0]["name"], "S55");
+        assert_eq!(ok["alternatives"][0]["note"], "plus doux");
+        assert!(ok["alternatives"][0]["estimated_tss"].as_f64().unwrap() > 0.0);
+
+        // Each alternative is checked like the main session; bad shapes are refused.
+        let (s, refused) = propose(serde_json::json!({"alternatives": [{"workout_id": 3}]})).await;
+        assert_eq!(s, StatusCode::UNPROCESSABLE_ENTITY, "{refused}");
+        assert!(refused["error"].as_str().unwrap().contains("alternative 3"), "{refused}");
+        assert_eq!(propose(serde_json::json!({"alternatives": [{"workout_id": 1}]})).await.0, StatusCode::BAD_REQUEST, "same as main");
+        assert_eq!(propose(serde_json::json!({"alternatives": [{"workout_id": 2}, {"workout_id": 2}]})).await.0, StatusCode::BAD_REQUEST, "duplicate");
+        assert_eq!(propose(serde_json::json!({"alternatives": [{"workout_id": 2},{"workout_id": 3},{"workout_id": 4},{"workout_id": 5}]})).await.0, StatusCode::BAD_REQUEST, "too many");
+        assert_eq!(propose(serde_json::json!({"alternatives": [{"workout_id": 999}]})).await.0, StatusCode::NOT_FOUND);
+        let (s, _) = propose(serde_json::json!({"workout_id": null, "free_ride_budget": {"duration_max_min": 60, "intent": "endurance"}, "alternatives": [{"workout_id": 2}]})).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "alternatives only go with a library session");
+        let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM planned_workouts").fetch_one(&pool).await.unwrap();
+        assert_eq!(n, 1, "refused proposals leave nothing behind");
+    }
+
+    #[tokio::test]
     async fn checkins_are_validated_and_replace_the_day() {
         let pool = SqlitePoolOptions::new().connect("sqlite::memory:").await.unwrap();
         crate::db::migrate(&pool).await.unwrap();

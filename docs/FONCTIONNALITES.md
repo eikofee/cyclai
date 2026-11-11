@@ -157,6 +157,7 @@ CyclAI peut être piloté par un agent (Claude) sans jamais lui laisser le derni
 - **Enveloppe de sortie** : pour un jour et un temps donnés, scénarios (tranquille, moyenne, longue avec dénivelé), fourchette de TSS apprise de votre historique, faisabilité au regard des règles.
 - **Recherche de séances** : filtres sur le temps par zone, le type, le TSS cible, et ce qui n'a pas été fait récemment ; IF, TSS et zones sont recalculés au FTP courant.
 - **Affichage d'une proposition** : la page de la séance montre le nom exact, le plan d'origine (catégorie › plan › semaine), durée / TSS / IF au FTP actuel et la structure en une ligne, au-dessus de la justification de l'agent et des boutons Confirmer / Refuser. L'API renvoie la même ligne (`structure_summary`).
+- **Alternatives** : une proposition peut offrir jusqu'à 3 autres séances (chacune vérifiée par les règles) ; la page de la proposition permet de basculer de l'une à l'autre avant de confirmer.
 - **Note du coach** : un message court affiché en haut du dashboard.
 - Deux accès : l'API REST (JWT signé, [API.md](../API.md)) et le serveur **MCP** avec OAuth pour Claude web / mobile ([MCP.md](MCP.md)).
 

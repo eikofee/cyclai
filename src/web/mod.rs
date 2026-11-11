@@ -60,6 +60,7 @@ pub async fn serve(pool: SqlitePool, bind: &str) -> anyhow::Result<()> {
         .route("/planned", post(planned::create))
         .route("/planned/{id}", get(planned::edit_form).post(planned::update))
         .route("/planned/{id}/delete", post(planned::delete))
+        .route("/planned/{id}/swap", post(planned::swap))
         .route("/planned/{id}/status", post(planned::set_status))
         .route("/planned/{id}/fit", get(planned::export_fit))
         .route("/digest", post(trigger_digest))

@@ -78,10 +78,12 @@ pub struct Planned {
     pub intent: Option<String>,
     /// The ride a `done` session was matched with.
     pub activity_id: Option<i64>,
+    /// Other sessions the agent offered with this proposal (JSON snapshot).
+    pub alternatives_json: Option<String>,
 }
 
 const COLUMNS: &str = "id, planned_date, name, steps_json, notes, workout_id, source, sport, status, rationale, \
-                       kind, budget_tss_min, budget_tss_max, budget_duration_max_min, intent, activity_id";
+                       kind, budget_tss_min, budget_tss_max, budget_duration_max_min, intent, activity_id, alternatives_json";
 
 impl Planned {
     pub fn is_free_ride(&self) -> bool {
@@ -394,6 +396,71 @@ pub async fn mark_proposal(pool: &SqlitePool, id: i64, rationale: &str, idempote
         .execute(pool)
         .await?;
     Ok(())
+}
+
+/// Snapshot of a library session offered as an alternative (what the user needs
+/// to choose: name, duration, TSS) - kept as it was at proposal time.
+pub fn alternative_snapshot(workout_id: i64, name: &str, steps_json: &str, athlete: &Athlete, note: Option<&str>) -> serde_json::Value {
+    let (minutes, tss) = serde_json::from_str::<Workout>(steps_json).map(|w| w.load_estimate(athlete)).unwrap_or((0.0, 0.0));
+    serde_json::json!({
+        "workout_id": workout_id,
+        "name": name,
+        "duration_min": (minutes * 10.0).round() / 10.0,
+        "estimated_tss": tss.round(),
+        "note": note,
+    })
+}
+
+impl Planned {
+    /// The alternatives offered with this proposal, if any.
+    pub fn alternatives(&self) -> Vec<serde_json::Value> {
+        self.alternatives_json
+            .as_deref()
+            .and_then(|j| serde_json::from_str(j).ok())
+            .unwrap_or_default()
+    }
+}
+
+pub async fn set_alternatives(pool: &SqlitePool, id: i64, alternatives: &[serde_json::Value]) -> anyhow::Result<()> {
+    let json = (!alternatives.is_empty()).then(|| serde_json::Value::Array(alternatives.to_vec()).to_string());
+    sqlx::query("UPDATE planned_workouts SET alternatives_json = ? WHERE id = ?").bind(json).bind(id).execute(pool).await?;
+    Ok(())
+}
+
+/// Replaces a still-`proposed` session by one of its alternatives; the former
+/// main session becomes an alternative in turn, so the choice can be undone.
+/// `Ok(Err(msg))` is a user-facing refusal.
+pub async fn swap_to_alternative(pool: &SqlitePool, id: i64, new_workout_id: i64, athlete: &Athlete) -> anyhow::Result<Result<(), String>> {
+    let Some(p) = get(pool, id).await? else { return Ok(Err("Séance introuvable.".into())) };
+    if p.status != "proposed" || p.is_free_ride() {
+        return Ok(Err("Seule une proposition en attente peut être remplacée.".into()));
+    }
+    let alts = p.alternatives();
+    let Some(chosen) = alts.iter().find(|a| a["workout_id"].as_i64() == Some(new_workout_id)) else {
+        return Ok(Err("Cette séance ne fait pas partie des alternatives proposées.".into()));
+    };
+    let row: Option<(String, String)> = sqlx::query_as("SELECT steps_json, sport FROM workouts WHERE id = ?").bind(new_workout_id).fetch_optional(pool).await?;
+    let Some((steps, sport)) = row else { return Ok(Err("Ce modèle n'existe plus.".into())) };
+    let sport = Sport::from_db(&sport);
+    let workout: serde_json::Value = serde_json::from_str(&steps).unwrap_or(serde_json::Value::Null);
+    let prepared = match prepare(&workout, athlete, sport) {
+        Ok(p) => p,
+        Err(m) => return Ok(Err(m)),
+    };
+    let mut next: Vec<serde_json::Value> = alts.iter().filter(|a| *a != chosen).cloned().collect();
+    if let Some(old) = p.workout_id {
+        next.push(alternative_snapshot(old, &p.name, &p.steps_json, athlete, None));
+    }
+    sqlx::query("UPDATE planned_workouts SET name = ?, steps_json = ?, workout_id = ?, sport = ?, updated_at = datetime('now') WHERE id = ?")
+        .bind(&prepared.name)
+        .bind(&prepared.steps_json)
+        .bind(new_workout_id)
+        .bind(sport.as_str())
+        .bind(id)
+        .execute(pool)
+        .await?;
+    set_alternatives(pool, id, &next).await?;
+    Ok(Ok(()))
 }
 
 pub async fn find_by_idempotency_key(pool: &SqlitePool, key: &str) -> anyhow::Result<Option<Planned>> {

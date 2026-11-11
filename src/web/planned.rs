@@ -230,6 +230,47 @@ fn status_banner(p: &crate::planned::Planned, id: i64) -> String {
     format!(r#"<div style="margin:0 0 1rem;padding:.8rem 1rem;border-left:4px solid currentColor;border-radius:8px;background:rgba(127,127,127,.12)"><strong>{label}</strong>{rationale}<p>{actions}</p></div>"#)
 }
 
+/// What else the agent offered for this proposal, each with a button to take
+/// it instead (the current one then becomes an alternative).
+fn alternatives_card(p: &crate::planned::Planned) -> String {
+    let alts = p.alternatives();
+    if alts.is_empty() || p.status != "proposed" {
+        return String::new();
+    }
+    let id = p.id;
+    let items: String = alts
+        .iter()
+        .filter_map(|a| {
+            let wid = a["workout_id"].as_i64()?;
+            let name = escape_html(a["name"].as_str().unwrap_or("?"));
+            let note = a["note"].as_str().map(|n| format!(r#"<div class="hint">{}</div>"#, escape_html(n))).unwrap_or_default();
+            Some(format!(
+                r#"<li style="margin:.5rem 0"><strong>{name}</strong> · {dur:.0} min · TSS ≈ {tss:.0}{note}
+<form method="post" action="/planned/{id}/swap" style="display:inline"><input type="hidden" name="workout_id" value="{wid}"><button type="submit" class="secondary">Prendre celle-ci à la place</button></form></li>"#,
+                dur = a["duration_min"].as_f64().unwrap_or(0.0),
+                tss = a["estimated_tss"].as_f64().unwrap_or(0.0),
+            ))
+        })
+        .collect();
+    format!(r#"<div style="margin:0 0 1rem;padding:.8rem 1rem;border-radius:8px;background:rgba(127,127,127,.08)"><strong>Autres options proposées</strong><ul style="list-style:none;padding:0;margin:.3rem 0 0">{items}</ul></div>"#)
+}
+
+#[derive(Deserialize)]
+pub struct SwapForm {
+    workout_id: i64,
+}
+
+/// `POST /planned/{id}/swap` — take one of the proposal's alternatives instead.
+pub async fn swap(State(state): State<AppState>, Path(id): Path<i64>, Form(form): Form<SwapForm>) -> Redirect {
+    let ath = fetch_athlete(&state.pool).await;
+    match crate::planned::swap_to_alternative(&state.pool, id, form.workout_id, &ath).await {
+        Ok(Ok(())) => {}
+        Ok(Err(msg)) => tracing::warn!(planned_id = id, msg, "swap refused"),
+        Err(err) => tracing::error!(?err, planned_id = id, "failed to swap proposal"),
+    }
+    Redirect::to(&format!("/planned/{id}"))
+}
+
 #[derive(Deserialize)]
 pub struct StatusForm {
     status: String,
@@ -327,7 +368,7 @@ pub async fn edit_form(State(state): State<AppState>, Path(id): Path<i64>) -> Re
     let mut banner = status_banner(&p, id);
     if !p.is_free_ride() && (p.status != "planned" || p.workout_id.is_some()) {
         // Sessions an agent put there (or answered to) show what was picked.
-        banner = format!("{}{banner}", selection_card(&state.pool, &p, &ath).await);
+        banner = format!("{}{banner}{}", selection_card(&state.pool, &p, &ath).await, alternatives_card(&p));
     }
     if p.is_free_ride() {
         return free_ride_page(&p, id, &banner).into_response();
@@ -432,5 +473,39 @@ mod tests {
         let mut broken = p;
         broken.steps_json = "not json".into();
         assert_eq!(selection_card(&pool, &broken, &ath).await, "");
+    }
+
+    #[tokio::test]
+    async fn swapping_takes_an_alternative_and_keeps_the_old_one_as_alternative() {
+        let pool = SqlitePoolOptions::new().connect("sqlite::memory:").await.unwrap();
+        crate::db::migrate(&pool).await.unwrap();
+        let steps = |name: &str, pct: u32| format!(r#"{{"name":"{name}","steps":[{{"type":"interval","duration":{{"type":"time","value":"60min"}},"target":{{"type":"ftp_pct_range","low":{pct},"high":{pct}}}}}]}}"#);
+        let (a, b) = (steps("Alpha", 65), steps("Beta", 90));
+        for (id, name, s) in [(901, "Alpha", &a), (902, "Beta", &b)] {
+            sqlx::query("INSERT INTO workouts (id, name, steps_json) VALUES (?, ?, ?)").bind(id).bind(name).bind(s).execute(&pool).await.unwrap();
+        }
+        let ath = Athlete { ftp_watts: 200.0, hr_rest: 50.0, hr_max: 190.0, run_threshold_pace_s: 0.0 };
+        sqlx::query("INSERT INTO planned_workouts (id, planned_date, name, steps_json, workout_id, status) VALUES (1, '2026-11-12', 'Alpha', ?, 901, 'proposed')")
+            .bind(&a).execute(&pool).await.unwrap();
+        let alt = crate::planned::alternative_snapshot(902, "Beta", &b, &ath, Some("plus dur"));
+        crate::planned::set_alternatives(&pool, 1, &[alt]).await.unwrap();
+
+        let card = alternatives_card(&crate::planned::get(&pool, 1).await.unwrap().unwrap());
+        assert!(card.contains("Beta") && card.contains("plus dur") && card.contains("/planned/1/swap"), "{card}");
+
+        // Not an offered alternative: refused. Offered: swapped, Alpha becomes the alternative.
+        assert!(crate::planned::swap_to_alternative(&pool, 1, 999, &ath).await.unwrap().is_err());
+        crate::planned::swap_to_alternative(&pool, 1, 902, &ath).await.unwrap().unwrap();
+        let p = crate::planned::get(&pool, 1).await.unwrap().unwrap();
+        assert_eq!((p.name.as_str(), p.workout_id), ("Beta", Some(902)));
+        assert!(p.steps_json.contains("90"));
+        let alts = p.alternatives();
+        assert_eq!(alts.len(), 1);
+        assert_eq!(alts[0]["workout_id"], 901);
+
+        // Once confirmed the choice is made: no more swapping, no more card.
+        assert!(crate::planned::set_status(&pool, 1, "confirmed").await.unwrap());
+        assert!(crate::planned::swap_to_alternative(&pool, 1, 901, &ath).await.unwrap().is_err());
+        assert_eq!(alternatives_card(&crate::planned::get(&pool, 1).await.unwrap().unwrap()), "");
     }
 }

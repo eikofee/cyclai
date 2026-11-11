@@ -236,7 +236,7 @@ fn tools() -> Vec<Tool> {
             description: "Propose a session for a day (today included; Strava is assumed synced). Give workout_id \
                           (from search_workouts) OR free_ride_budget. Stored as `proposed`; the athlete validates it \
                           in the dashboard. Refused with `rule_violation` if it would newly break a hard rule. \
-                          Retrying with the same idempotency_key returns the first proposal.",
+                          Retrying with the same idempotency_key returns the first proposal. Optionally offer `alternatives`.",
             scope: SCOPE_PROPOSE,
             route: Route::Post("/api/v1/proposals"),
             input: obj(
@@ -253,6 +253,18 @@ fn tools() -> Vec<Tool> {
                     ),
                     "rationale": text("Why this session on this day; shown to the athlete."),
                     "idempotency_key": text("Stable key to make retries safe."),
+                    "alternatives": json!({
+                        "type": "array",
+                        "maxItems": 3,
+                        "description": "Up to 3 other library sessions the athlete may prefer (only with workout_id). Each is checked against the hard rules like the main one; the athlete can swap in the dashboard.",
+                        "items": obj(
+                            json!({
+                                "workout_id": int("Library session id."),
+                                "note": text("What it trades off vs the main session. Max 200 chars."),
+                            }),
+                            &["workout_id"],
+                        ),
+                    }),
                 }),
                 &["date", "rationale"],
             ),

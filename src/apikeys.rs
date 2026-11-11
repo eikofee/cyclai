@@ -35,10 +35,17 @@ impl Scope {
     }
 }
 
+/// `aud` pins a token to this service, `iss` to the key that signed it (its
+/// name, same as the `kid` header): a token minted for something else, or
+/// signed by another registered key, is refused.
+pub const AUDIENCE: &str = "cyclai";
+
 #[derive(Debug, Serialize, Deserialize)]
 struct Claims {
     exp: i64,
     iat: i64,
+    iss: String,
+    aud: String,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -114,7 +121,9 @@ pub async fn authenticate(pool: &SqlitePool, token: &str, is_write: bool) -> Res
 
     let mut validation = Validation::new(Algorithm::RS256);
     validation.leeway = LEEWAY_S;
-    validation.set_required_spec_claims(&["exp"]);
+    validation.set_required_spec_claims(&["exp", "aud", "iss"]);
+    validation.set_audience(&[AUDIENCE]);
+    validation.set_issuer(&[kid.as_str()]);
     let claims = decode::<Claims>(token, &key, &validation)
         .map_err(|_| AuthError::Invalid("bad signature or expired"))?
         .claims;
@@ -152,7 +161,7 @@ pub fn mint_token(private_key_pem: &str, kid: &str, ttl_s: i64) -> anyhow::Resul
     header.kid = Some(kid.to_string());
     let key = EncodingKey::from_rsa_pem(private_key_pem.as_bytes())
         .map_err(|e| anyhow::anyhow!("not a valid RSA private key in PEM format: {e}"))?;
-    Ok(encode(&header, &Claims { iat: now, exp: now + ttl_s }, &key)?)
+    Ok(encode(&header, &Claims { iat: now, exp: now + ttl_s, iss: kid.to_string(), aud: AUDIENCE.to_string() }, &key)?)
 }
 
 #[cfg(test)]
@@ -198,11 +207,36 @@ mod tests {
         let sign = |iat: i64, exp: i64| {
             let mut h = Header::new(Algorithm::RS256);
             h.kid = Some("laptop".into());
-            encode(&h, &Claims { iat, exp }, &EncodingKey::from_rsa_pem(PRIVATE.as_bytes()).unwrap()).unwrap()
+            encode(&h, &Claims { iat, exp, iss: "laptop".into(), aud: AUDIENCE.into() }, &EncodingKey::from_rsa_pem(PRIVATE.as_bytes()).unwrap()).unwrap()
         };
         assert!(authenticate(&pool, &sign(now - 600, now - 300), false).await.is_err());
         assert!(authenticate(&pool, &sign(now, now + 3600), false).await.is_err());
         assert!(authenticate(&pool, &sign(now + 600, now + 660), false).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn audience_and_issuer_must_match() {
+        let pool = pool_with_key(Scope::Read).await;
+        let now = chrono::Utc::now().timestamp();
+        let sign = |iss: &str, aud: &str| {
+            let mut h = Header::new(Algorithm::RS256);
+            h.kid = Some("laptop".into());
+            encode(&h, &Claims { iat: now, exp: now + 60, iss: iss.into(), aud: aud.into() }, &EncodingKey::from_rsa_pem(PRIVATE.as_bytes()).unwrap()).unwrap()
+        };
+        assert!(authenticate(&pool, &sign("laptop", AUDIENCE), false).await.is_ok());
+        assert!(authenticate(&pool, &sign("laptop", "other-service"), false).await.is_err());
+        assert!(authenticate(&pool, &sign("someone-else", AUDIENCE), false).await.is_err());
+
+        // A token without aud / iss (the old format) is refused.
+        #[derive(Serialize)]
+        struct Old {
+            iat: i64,
+            exp: i64,
+        }
+        let mut h = Header::new(Algorithm::RS256);
+        h.kid = Some("laptop".into());
+        let old = encode(&h, &Old { iat: now, exp: now + 60 }, &EncodingKey::from_rsa_pem(PRIVATE.as_bytes()).unwrap()).unwrap();
+        assert!(authenticate(&pool, &old, false).await.is_err());
     }
 
     #[tokio::test]

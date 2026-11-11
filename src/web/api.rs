@@ -438,6 +438,7 @@ fn planned_json(p: &crate::planned::Planned, ath: &crate::workout::Athlete) -> V
         "sport": p.sport,
         "status": p.status,
         "rationale": p.rationale,
+        "alternatives": p.alternatives(),
         "duration_min": round(minutes, 1),
         "estimated_tss": round(tss, 0),
         "estimated_if": crate::rules::intensity_factor(minutes, tss).map(|f| round(f, 2)),
@@ -522,6 +523,67 @@ pub(super) struct ProposalRequest {
     rationale: String,
     /// Retrying with the same key returns the first proposal instead of a duplicate.
     idempotency_key: Option<String>,
+    /// Up to 3 other library sessions the athlete may prefer (only with `workout_id`).
+    /// Each is checked against the hard rules like the main one.
+    #[serde(default)]
+    alternatives: Vec<AlternativeRequest>,
+}
+
+#[derive(Deserialize)]
+pub(super) struct AlternativeRequest {
+    workout_id: i64,
+    /// Why it is an alternative (what it trades off). Max 200 characters.
+    note: Option<String>,
+}
+
+const MAX_ALTERNATIVES: usize = 3;
+
+/// A library session, ready to be stored.
+async fn load_library(
+    pool: &SqlitePool,
+    ath: &crate::workout::Athlete,
+    workout_id: i64,
+) -> Result<(String, Value, crate::planned::Prepared, crate::planned::Sport), ApiError> {
+    let row: Option<(String, String)> = sqlx::query_as("SELECT steps_json, sport FROM workouts WHERE id = ?")
+        .bind(workout_id)
+        .fetch_optional(pool)
+        .await?;
+    let (steps, sport) = row.ok_or_else(|| ApiError(StatusCode::NOT_FOUND, format!("workout template {workout_id} not found")))?;
+    let workout: Value = serde_json::from_str(&steps).unwrap_or(Value::Null);
+    let sport = crate::planned::Sport::from_db(&sport);
+    let prepared = crate::planned::prepare(&workout, ath, sport).map_err(|m| ApiError(StatusCode::BAD_REQUEST, m))?;
+    Ok((steps, workout, prepared, sport))
+}
+
+/// Refuses only what a session adds: a violation already present in the
+/// calendar isn't the proposal's fault.
+fn refuse_if_it_breaks_rules(
+    past: &[crate::rules::PastDay],
+    base: &[crate::rules::FutureSession],
+    rules: &crate::rules::Rules,
+    date: chrono::NaiveDate,
+    minutes: f64,
+    tss: f64,
+    what: &str,
+) -> Result<(), ApiError> {
+    let mut with = base.to_vec();
+    with.push(crate::rules::FutureSession { date, tss, intensity_factor: crate::rules::intensity_factor(minutes, tss) });
+    let before = crate::rules::simulate(past, base, rules).violations;
+    let added: Vec<_> = crate::rules::simulate(past, &with, rules)
+        .violations
+        .into_iter()
+        .filter(|v| !before.iter().any(|b| b.rule == v.rule && b.date == v.date))
+        .collect();
+    if added.is_empty() {
+        return Ok(());
+    }
+    Err(ApiError(
+        StatusCode::UNPROCESSABLE_ENTITY,
+        format!(
+            "{what} refused, it would break: {}",
+            added.iter().map(|v| format!("{} ({}: {})", v.rule, v.date, v.message)).collect::<Vec<_>>().join("; ")
+        ),
+    ))
 }
 
 #[derive(Deserialize)]
@@ -575,15 +637,7 @@ pub(super) async fn proposal_create(
 
     let candidate = match (req.workout_id, req.free_ride_budget) {
         (Some(workout_id), None) => {
-            let row: Option<(String, String)> = sqlx::query_as("SELECT steps_json, sport FROM workouts WHERE id = ?")
-                .bind(workout_id)
-                .fetch_optional(&state.pool)
-                .await?;
-            let (steps, sport) =
-                row.ok_or_else(|| ApiError(StatusCode::NOT_FOUND, format!("workout template {workout_id} not found")))?;
-            let workout: Value = serde_json::from_str(&steps).unwrap_or(Value::Null);
-            let sport = crate::planned::Sport::from_db(&sport);
-            let prepared = crate::planned::prepare(&workout, &ath, sport).map_err(|m| ApiError(StatusCode::BAD_REQUEST, m))?;
+            let (_, workout, prepared, sport) = load_library(&state.pool, &ath, workout_id).await?;
             Candidate::Library { workout, prepared, sport, workout_id }
         }
         (None, Some(b)) => {
@@ -602,6 +656,18 @@ pub(super) async fn proposal_create(
         }
         _ => return Err(bad("give either `workout_id` or `free_ride_budget`")),
     };
+    if !req.alternatives.is_empty() {
+        let Candidate::Library { workout_id: main_id, .. } = &candidate else {
+            return Err(bad("`alternatives` only go with a `workout_id` proposal"));
+        };
+        let ids: std::collections::HashSet<i64> = req.alternatives.iter().map(|a| a.workout_id).collect();
+        if req.alternatives.len() > MAX_ALTERNATIVES || ids.len() != req.alternatives.len() || ids.contains(main_id) {
+            return Err(bad(&format!("`alternatives`: at most {MAX_ALTERNATIVES}, distinct, and different from the main `workout_id`")));
+        }
+        if req.alternatives.iter().any(|a| a.note.as_deref().is_some_and(|n| n.chars().count() > 200)) {
+            return Err(bad("an alternative `note` is limited to 200 characters"));
+        }
+    }
 
     // Refuse only what this session adds: a violation already present in the
     // calendar isn't the proposal's fault. A free ride is checked at the top
@@ -613,22 +679,19 @@ pub(super) async fn proposal_create(
         Candidate::FreeRide(b) => (b.duration_max_min as f64, b.tss_max),
     };
     let base = calendar_sessions(&state.pool, &ath, projection_start(&past), horizon).await?;
-    let mut with = base.clone();
-    with.push(crate::rules::FutureSession { date, tss, intensity_factor: crate::rules::intensity_factor(minutes, tss) });
-    let before = crate::rules::simulate(&past, &base, &rules).violations;
-    let added: Vec<_> = crate::rules::simulate(&past, &with, &rules)
-        .violations
-        .into_iter()
-        .filter(|v| !before.iter().any(|b| b.rule == v.rule && b.date == v.date))
-        .collect();
-    if !added.is_empty() {
-        return Err(ApiError(
-            StatusCode::UNPROCESSABLE_ENTITY,
-            format!(
-                "refused, it would break: {}",
-                added.iter().map(|v| format!("{} ({}: {})", v.rule, v.date, v.message)).collect::<Vec<_>>().join("; ")
-            ),
-        ));
+    refuse_if_it_breaks_rules(&past, &base, &rules, date, minutes, tss, "proposal")?;
+
+    // Every alternative must be one the engine would accept too.
+    let mut alternatives: Vec<Value> = Vec::new();
+    for alt in &req.alternatives {
+        let (steps, workout, ..) = load_library(&state.pool, &ath, alt.workout_id).await?;
+        let (m, t) = serde_json::from_value::<crate::workout::Workout>(workout.clone())
+            .map(|w| w.load_estimate(&ath))
+            .unwrap_or((0.0, 0.0));
+        refuse_if_it_breaks_rules(&past, &base, &rules, date, m, t, &format!("alternative {}", alt.workout_id))?;
+        let name = workout.get("name").and_then(Value::as_str).unwrap_or("");
+        let note = alt.note.as_deref().map(str::trim).filter(|n| !n.is_empty());
+        alternatives.push(crate::planned::alternative_snapshot(alt.workout_id, name, &steps, &ath, note));
     }
 
     let id = match &candidate {
@@ -638,6 +701,7 @@ pub(super) async fn proposal_create(
         Candidate::FreeRide(budget) => crate::planned::insert_free_ride(&state.pool, date, budget, "api").await?,
     };
     crate::planned::mark_proposal(&state.pool, id, rationale, key).await?;
+    crate::planned::set_alternatives(&state.pool, id, &alternatives).await?;
     let created = crate::planned::get(&state.pool, id)
         .await?
         .ok_or_else(|| ApiError(StatusCode::INTERNAL_SERVER_ERROR, "planned session vanished".into()))?;

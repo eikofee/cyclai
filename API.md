@@ -19,6 +19,8 @@ Claims et en-tête exigés :
 |---|---|
 | en-tête `alg` | `RS256` (le seul accepté) |
 | en-tête `kid` | nom de la clé enregistrée côté serveur |
+| `iss` | le nom de la clé (identique à `kid`) |
+| `aud` | `cyclai` |
 | `iat` | date d'émission (epoch, secondes) |
 | `exp` | expiration ; `exp - iat` ≤ **300 s** (tolérance d'horloge 30 s) |
 
@@ -46,7 +48,7 @@ Exemple client Python (`pip install pyjwt cryptography`) :
 ```python
 import time, jwt
 now = int(time.time())
-token = jwt.encode({"iat": now, "exp": now + 60}, open("cyclai.key").read(),
+token = jwt.encode({"iss": "laptop", "aud": "cyclai", "iat": now, "exp": now + 60}, open("cyclai.key").read(),
                    algorithm="RS256", headers={"kid": "laptop"})
 ```
 
@@ -470,6 +472,19 @@ Clé `write`. Suggère une séance à partir d'un modèle ; l'utilisateur la **c
 - `400` : date antérieure à aujourd'hui ou à plus de 120 jours, `rationale` vide ou de plus de 500 caractères, clé de plus de 100 caractères ; `404` : modèle inconnu.
 
 La date peut être aujourd'hui : la séance s'ajoute alors à la charge déjà roulée (Strava supposé synchronisé).
+
+#### Alternatives
+
+`alternatives` (facultatif, avec `workout_id` uniquement) offre jusqu'à 3 autres séances de la bibliothèque entre lesquelles l'utilisateur peut choisir :
+
+```json
+{"date": "2026-11-14", "workout_id": 12, "rationale": "Séance clé", "alternatives": [
+  {"workout_id": 31, "note": "plus doux si les jambes sont lourdes"}, {"workout_id": 40}]}
+```
+
+- Chaque alternative est vérifiée comme la séance principale : si l'une enfreindrait une règle dure, toute la requête est refusée (`422`, `alternative 31 refused…`) et rien n'est enregistré. `400` : plus de 3, doublons, identique à la séance principale, `note` de plus de 200 caractères, ou combinées à `free_ride_budget` ; `404` : modèle inconnu.
+- La séance renvoyée porte `alternatives` : `[{workout_id, name, duration_min, estimated_tss, note}]` (instantané au moment de la proposition).
+- Dans le dashboard, la page de la proposition liste ces options ; « Prendre celle-ci à la place » remplace la séance (l'ancienne devient une alternative), tant qu'elle n'est pas confirmée.
 
 #### Sorties libres
 

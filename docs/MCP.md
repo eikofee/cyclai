@@ -54,7 +54,7 @@ cyclai oauth set-refresh-days 90   # inactivité maximale avant ré-autorisation
 | `get_availability` | read | Temps disponible jour par jour |
 | `get_ride_envelope` | read | Scénarios de sortie possibles un jour donné, faisabilité vs règles |
 | `project_load` | read | Simulation de charge et violations (n'écrit rien) |
-| `propose_session` | propose | Propose une séance (`workout_id` ou `free_ride_budget`) ; statut `proposed` |
+| `propose_session` | propose | Propose une séance (`workout_id` ou `free_ride_budget`, avec jusqu'à 3 `alternatives`) ; statut `proposed` |
 | `set_availability` | propose | Exception de disponibilité (jour ou plage) |
 | `mark_session_skipped` | propose | Marque une séance à venir comme passée |
 | `log_checkin` | propose | Ressenti du jour |
