@@ -18,7 +18,7 @@ const THEME_PRESETS: [(&str, &str); 9] = [
 ];
 
 fn page_shell(body: &str) -> String {
-    let header = super::layout::page_header("Paramètres", "Clés, profil physiologique, profil cycliste et prompts du LLM.", "");
+    let header = super::layout::page_header("Paramètres", "Apparence, entraînement, sources d'activités et intelligence artificielle.", "");
     let content = format!("{header}{body}");
     super::layout::Page::new("Paramètres", super::layout::Nav::Settings, &content)
         .class("narrow")
@@ -29,7 +29,19 @@ input.color-input { width: 36px; height: 36px; padding: 2px; margin: 0; cursor: 
 .swatch:hover { transform: scale(1.1); border-color: var(--card-bg); }
 .swatch.selected { box-shadow: 0 0 0 2px var(--text); }
 .swatch-custom { display: inline-flex; align-items: center; gap: 0.4rem; margin-left: 0.5rem; }
-.swatch-custom .hint { margin: 0; }")
+.swatch-custom .hint { margin: 0; }
+.settings-nav { display: flex; flex-wrap: wrap; gap: 0.4rem; margin: 0 0 1.4rem; position: sticky; top: 0; z-index: 5; padding: 0.5rem 0; background: var(--bg, var(--card-bg)); }
+.settings-nav a { padding: 0.3rem 0.8rem; border-radius: 999px; border: 1px solid var(--border-strong); font-size: 0.85rem; text-decoration: none; color: var(--text); }
+.settings-nav a:hover { border-color: var(--text); }
+.settings-group { margin: 0 0 2.2rem; scroll-margin-top: 3.5rem; }
+.settings-group > .group-title { font-size: 0.78rem; text-transform: uppercase; letter-spacing: 0.08em; color: var(--text-muted); margin: 0 0 0.6rem 0.2rem; }
+.settings-group > section + section { margin-top: 1rem; }
+.source-row { display: flex; align-items: center; gap: 0.6rem; padding: 0.5rem 0; border-bottom: 1px solid var(--border); flex-wrap: wrap; }
+.source-row:last-of-type { border-bottom: 0; }
+.source-row .grow { flex: 1; min-width: 10rem; }
+.source-row label { display: inline-flex; align-items: center; gap: 0.4rem; margin: 0; }
+.source-row button { padding: 0.15rem 0.55rem; margin: 0; }
+.badge { font-size: 0.72rem; padding: 0.1rem 0.5rem; border-radius: 999px; border: 1px solid var(--border-strong); color: var(--text-muted); }")
         .render()
 }
 
@@ -100,8 +112,37 @@ async fn render_page(pool: &sqlx::SqlitePool, error: Option<&str>) -> Html<Strin
             .collect()
     };
 
+    let source_cfg = crate::sources::config(pool).await;
+    let mut source_rows = String::new();
+    for (i, id) in source_cfg.order.iter().enumerate() {
+        let configured = crate::sources::is_configured(pool, id).await;
+        let enabled = source_cfg.enabled.contains(id);
+        let badge = if configured { "identifiants renseignés" } else { "à configurer" };
+        let up = if i > 0 { format!(r#"<button type="submit" name="move" value="{id}:up" class="secondary" title="Monter" aria-label="Monter">↑</button>"#) } else { String::new() };
+        let down = if i + 1 < source_cfg.order.len() {
+            format!(r#"<button type="submit" name="move" value="{id}:down" class="secondary" title="Descendre" aria-label="Descendre">↓</button>"#)
+        } else {
+            String::new()
+        };
+        source_rows.push_str(&format!(
+            r#"<div class="source-row"><span><strong>{rank}.</strong></span>
+  <label class="grow"><input type="checkbox" name="enabled" value="{id}"{checked}> {label} <span class="badge">{badge}</span></label>
+  <input type="hidden" name="order" value="{id}">{up}{down}</div>
+"#,
+            rank = i + 2,
+            label = crate::sources::label(id),
+            checked = if enabled { " checked" } else { "" },
+        ));
+    }
+
     let body = format!(
-        r#"{error_html}
+        r##"{error_html}
+<nav class="settings-nav" aria-label="Catégories">
+  <a href="#general">Général</a><a href="#entrainement">Entraînement</a><a href="#sources">Sources d'activités</a><a href="#ia">Intelligence artificielle</a>
+</nav>
+
+<div class="settings-group" id="general">
+<div class="group-title" role="heading" aria-level="2">Général</div>
 <section>
 <h2>Apparence</h2>
 <form method="post" action="/settings/appearance">
@@ -124,27 +165,10 @@ document.querySelectorAll('.swatch').forEach(function(b) {{
 </form>
 </section>
 
-<section>
-<h2>Clés API</h2>
-<form method="post" action="/settings/keys">
-  <label>Strava Client ID
-  <input type="text" name="strava_client_id" value="{strava_client_id}">
-  </label>
-  <label>Strava Client Secret
-  <input type="password" autocomplete="off" name="strava_client_secret" value="{strava_client_secret}">
-  </label>
-  <label>Strava Refresh Token
-  <input type="password" autocomplete="off" name="strava_refresh_token" value="{strava_refresh_token}">
-  </label>
-  <p class="hint">Renouvelé automatiquement par Strava à chaque synchronisation — à renseigner manuellement seulement pour une première configuration ou après révocation.</p>
-  <label>Clé API Anthropic
-  <input type="password" autocomplete="off" name="anthropic_api_key" value="{anthropic_api_key}">
-  </label>
-  <p class="hint">Optionnelle : sans clé, les bilans/digests ne sont pas générés automatiquement, mais un « rapport IA » est téléchargeable depuis le dashboard et les pages d'activité pour le coller dans Claude, ChatGPT…</p>
-  <button type="submit">Enregistrer</button>
-</form>
-</section>
+</div>
 
+<div class="settings-group" id="entrainement">
+<div class="group-title" role="heading" aria-level="2">Entraînement</div>
 <section>
 <h2>Profil physiologique</h2>
 <p class="hint">FTP recalcule rétroactivement TSS/IF/zones de tout l'historique une fois enregistrée. Les FC (max, repos, seuil) recalculent le hrTSS des courses à pied.</p>
@@ -229,6 +253,66 @@ document.querySelectorAll('.swatch').forEach(function(b) {{
 </form>
 </section>
 
+</div>
+
+<div class="settings-group" id="sources">
+<div class="group-title" role="heading" aria-level="2">Sources d'activités</div>
+<section>
+<h2>Priorité et activation</h2>
+<p class="hint">CyclAI fonctionne seul : l'import de fichiers .fit/.gpx (bouton du tableau de bord) est toujours disponible et passe en premier. Strava et Garmin sont des plugins, désactivés tant que tu ne les actives pas. « Synchroniser » interroge les sources activées dans l'ordre ci-dessous ; une activité qui chevauche une activité déjà enregistrée est ignorée, donc la source la mieux classée l'emporte.</p>
+<form method="post" action="/settings/sources">
+  <div class="source-row"><span><strong>1.</strong></span><span class="grow">Fichier .fit/.gpx <span class="badge">toujours actif</span></span></div>
+{source_rows}
+  <label>Chevauchement toléré entre deux activités (secondes)
+  <input type="number" name="overlap_tolerance_s" value="{overlap_tolerance_s}" min="0" max="3600" step="1">
+  </label>
+  <p class="hint">Deux activités ne sont considérées comme superposées que si elles partagent plus de ce nombre de secondes (une sortie qui enchaîne directement sur la suivante ne compte pas).</p>
+  <button type="submit">Enregistrer</button>
+  <p class="hint">Le nouvel ordre ne joue que pour les prochaines synchronisations : les activités déjà enregistrées ne changent pas. Pour réappliquer un ordre à tout l'historique, il faut le réimporter.</p>
+</form>
+</section>
+<section>
+<h2>Strava</h2>
+<form method="post" action="/settings/keys">
+  <label>Client ID
+  <input type="text" name="strava_client_id" value="{strava_client_id}">
+  </label>
+  <label>Client Secret
+  <input type="password" autocomplete="off" name="strava_client_secret" value="{strava_client_secret}">
+  </label>
+  <label>Refresh Token
+  <input type="password" autocomplete="off" name="strava_refresh_token" value="{strava_refresh_token}">
+  </label>
+  <p class="hint">Renouvelé automatiquement par Strava à chaque synchronisation — à renseigner manuellement seulement pour une première configuration ou après révocation.</p>
+  <button type="submit">Enregistrer</button>
+</form>
+</section>
+
+<section>
+<h2>Garmin Connect</h2>
+<form method="post" action="/settings/keys">
+  <label>Clé API personnelle
+  <input type="password" autocomplete="off" name="garmin_api_key" value="{garmin_api_key}">
+  </label>
+  <p class="hint">À créer dans Garmin Connect, sous Paramètres → API personnelle (elle expire après 30, 90, 180 ou 365 jours). Seuls le vélo de route, le home-trainer et la course à pied sont importés ; chaque activité est récupérée avec son fichier .fit d'origine.</p>
+  <button type="submit">Enregistrer</button>
+</form>
+</section>
+</div>
+
+<div class="settings-group" id="ia">
+<div class="group-title" role="heading" aria-level="2">Intelligence artificielle</div>
+<section>
+<h2>Clé API Anthropic</h2>
+<form method="post" action="/settings/keys">
+  <label>Clé API
+  <input type="password" autocomplete="off" name="anthropic_api_key" value="{anthropic_api_key}">
+  </label>
+  <p class="hint">Optionnelle : sans clé, les bilans/digests ne sont pas générés automatiquement, mais un « rapport IA » est téléchargeable depuis le dashboard et les pages d'activité pour le coller dans Claude, ChatGPT…</p>
+  <button type="submit">Enregistrer</button>
+</form>
+</section>
+
 <section>
 <h2>Profil cycliste</h2>
 <p class="hint">Réinjecté dans chaque prompt envoyé au LLM (bilans et digest hebdomadaire) : FTP/zones, objectifs, équipement, contraintes...</p>
@@ -255,7 +339,8 @@ document.querySelectorAll('.swatch').forEach(function(b) {{
   <button type="submit">Enregistrer</button>
 </form>
 </section>
-"#,
+</div>
+"##,
         error_html = error_html,
         theme_color = escape_html(&settings.theme_color),
         swatches = THEME_PRESETS
@@ -286,6 +371,9 @@ document.querySelectorAll('.swatch').forEach(function(b) {{
         max_consec = rules.max_consecutive_intense,
         min_rest = rules.min_rest_days_per_week,
         run_pace = run_pace,
+        source_rows = source_rows,
+        overlap_tolerance_s = source_cfg.tolerance_s,
+        garmin_api_key = escape_html(&source_cfg.garmin_api_key),
         strava_client_id = escape_html(&settings.strava_client_id),
         strava_client_secret = escape_html(&settings.strava_client_secret),
         strava_refresh_token = escape_html(strava_refresh_token.as_deref().unwrap_or("")),
@@ -304,39 +392,41 @@ pub async fn page(State(state): State<AppState>) -> Html<String> {
 
 #[derive(Deserialize)]
 pub struct KeysForm {
-    #[serde(default)]
-    strava_client_id: String,
-    #[serde(default)]
-    strava_client_secret: String,
-    #[serde(default)]
-    strava_refresh_token: String,
-    #[serde(default)]
-    anthropic_api_key: String,
+    strava_client_id: Option<String>,
+    strava_client_secret: Option<String>,
+    strava_refresh_token: Option<String>,
+    anthropic_api_key: Option<String>,
+    garmin_api_key: Option<String>,
 }
 
 pub async fn update_keys(State(state): State<AppState>, axum::extract::Form(form): axum::extract::Form<KeysForm>) -> Redirect {
-    let _ = sqlx::query(
-        "UPDATE settings SET strava_client_id = ?, strava_client_secret = ?, anthropic_api_key = ? WHERE id = 1",
-    )
-    .bind(form.strava_client_id.trim())
-    .bind(form.strava_client_secret.trim())
-    .bind(form.anthropic_api_key.trim())
-    .execute(&state.pool)
-    .await;
+    // Strava and Anthropic have their own forms: only the fields a form sent are written.
+    for (column, value) in [
+        ("strava_client_id", &form.strava_client_id),
+        ("strava_client_secret", &form.strava_client_secret),
+        ("anthropic_api_key", &form.anthropic_api_key),
+        ("garmin_api_key", &form.garmin_api_key),
+    ] {
+        if let Some(v) = value {
+            let _ = sqlx::query(&format!("UPDATE settings SET {column} = ? WHERE id = 1")).bind(v.trim()).execute(&state.pool).await;
+        }
+    }
 
     // sync_state may not have a row yet on a fresh DB (only ever seeded/
-    // written by the boot seed or a completed sync) — upsert rather than
+    // written by the boot seed or a completed sync) - upsert rather than
     // assume it exists.
-    let _ = sqlx::query(
-        r#"
-        INSERT INTO sync_state (id, last_sync_epoch, strava_refresh_token)
-        VALUES (1, 0, ?)
-        ON CONFLICT (id) DO UPDATE SET strava_refresh_token = excluded.strava_refresh_token
-        "#,
-    )
-    .bind(form.strava_refresh_token.trim())
-    .execute(&state.pool)
-    .await;
+    if let Some(token) = &form.strava_refresh_token {
+        let _ = sqlx::query(
+            r#"
+            INSERT INTO sync_state (id, last_sync_epoch, strava_refresh_token)
+            VALUES (1, 0, ?)
+            ON CONFLICT (id) DO UPDATE SET strava_refresh_token = excluded.strava_refresh_token
+            "#,
+        )
+        .bind(token.trim())
+        .execute(&state.pool)
+        .await;
+    }
 
     Redirect::to("/settings")
 }
@@ -527,4 +617,30 @@ pub async fn update_digest_prompt(State(state): State<AppState>, axum::extract::
         .execute(&state.pool)
         .await;
     Redirect::to("/settings")
+}
+
+/// `POST /settings/sources` — which plugins are enabled, in which priority
+/// order, and the tolerated overlap. A `move` button (`<id>:up` / `<id>:down`)
+/// also saves the rest of the form, so nothing typed is lost.
+pub async fn update_sources(State(state): State<AppState>, axum::extract::Form(fields): axum::extract::Form<Vec<(String, String)>>) -> Redirect {
+    let values = |name: &str| fields.iter().filter(|(k, _)| k == name).map(|(_, v)| v.clone()).collect::<Vec<_>>();
+    let mut order = crate::sources::normalize_order(&values("order"));
+    if let Some(m) = values("move").first()
+        && let Some((id, dir)) = m.split_once(':')
+        && let Some(i) = order.iter().position(|s| s == id)
+    {
+        let j = if dir == "up" { i.checked_sub(1) } else { Some(i + 1).filter(|j| *j < order.len()) };
+        if let Some(j) = j {
+            order.swap(i, j);
+        }
+    }
+    if let Err(err) = crate::sources::save_order_and_enabled(&state.pool, &order, &values("enabled")).await {
+        tracing::error!(?err, "failed to save source order");
+    }
+    if let Some(Ok(seconds)) = values("overlap_tolerance_s").first().map(|v| v.trim().parse::<i64>())
+        && let Err(err) = crate::sources::save_tolerance(&state.pool, seconds).await
+    {
+        tracing::error!(?err, "failed to save overlap tolerance");
+    }
+    Redirect::to("/settings#sources")
 }

@@ -75,6 +75,7 @@ pub async fn serve(pool: SqlitePool, bind: &str) -> anyhow::Result<()> {
         .route("/segments", get(segments::page))
         .route("/segments/import", post(segments::import))
         .route("/settings", get(settings::page))
+        .route("/settings/sources", post(settings::update_sources))
         .route("/settings/keys", post(settings::update_keys))
         .route("/settings/profile", post(settings::update_profile))
         .route("/settings/prompts/bilan", post(settings::update_bilan_prompt))
@@ -1040,6 +1041,10 @@ const SYNC_STATUS_JS: &str = r#"
           box.hidden = false;
           box.className = 'sync-status error';
           box.textContent = 'Échec de la synchronisation : ' + p.error;
+        } else if (p.warning) {
+          box.hidden = false;
+          box.className = 'sync-status error';
+          box.innerHTML = 'Synchronisation terminée, mais certaines sources ont échoué : ' + esc(p.warning) + ' · <a href="/">recharger</a>';
         } else {
           location.reload();
         }
@@ -1065,7 +1070,7 @@ fn render_page(
     let calendar_html = render_calendar_html(calendar_activities, calendar_planned);
 
     let actions = r#"<form method="post" action="/sync">
-  <button type="submit">Synchroniser Strava</button>
+  <button type="submit" title="Interroge toutes les sources activées dans Paramètres > Sources d'activités">Synchroniser</button>
   <button type="submit" formaction="/sync/full" class="secondary" title="Importe aussi les activités plus anciennes pas encore en base (ex: courses à pied)">Tout l'historique</button>
 </form>
 <form method="post" action="/import" enctype="multipart/form-data">

@@ -1,4 +1,4 @@
-mod models;
+pub mod models;
 
 pub use models::{Lap, StarredSegment, SummaryActivity};
 use models::{DetailedActivity, TokenResponse};

@@ -29,7 +29,8 @@ src/
   db/                connexion sqlx, migrations, seeds, rattrapage des miniatures
 
   strava/            client API : OAuth (refresh rotatif), activités, streams, laps, segments favoris
-  sync.rs            orchestration du sync (normal et --full)
+  sources/           plugins d'activités : trait ActivitySource (list / fetch), Strava, Garmin Connect (API personnelle, .fit d'origine), config (activation, ordre, tolérance), insertion commune et règle de chevauchement
+  sync.rs            orchestration du sync (normal et --full) : boucle sur les plugins activés, par ordre de priorité
   zwift.rs           catalogue « Depuis Zwift » : plans et collections vélo > semaines/sous-groupes (data/zwift_plans.json, généré par tools/scrape_zwift.py), importé au démarrage
   garmin.rs          export d'une séance en .fit Garmin (rampes -> plages de puissance, % FTP ou watts)
   importer.rs        parseurs FIT (fitparser) et GPX (gpx) -> même forme que le sync Strava

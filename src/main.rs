@@ -10,6 +10,7 @@ mod importer;
 mod llm;
 mod metrics;
 mod oauth;
+mod sources;
 mod performance;
 mod planned;
 mod report;

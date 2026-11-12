@@ -1,7 +1,6 @@
-use crate::strava::StravaClient;
 use chrono::Utc;
 use serde::Serialize;
-use sqlx::{FromRow, SqlitePool};
+use sqlx::SqlitePool;
 use std::sync::Mutex;
 
 /// What the running sync is doing right now, polled by the dashboard
@@ -13,6 +12,8 @@ pub struct Progress {
     pub done: usize,
     pub total: usize,
     pub error: Option<String>,
+    /// Set when some sources failed but others went through.
+    pub warning: Option<String>,
 }
 
 static PROGRESS: Mutex<Progress> = Mutex::new(Progress {
@@ -21,6 +22,7 @@ static PROGRESS: Mutex<Progress> = Mutex::new(Progress {
     done: 0,
     total: 0,
     error: None,
+    warning: None,
 });
 
 pub fn progress() -> Progress {
@@ -40,15 +42,22 @@ fn try_start() -> bool {
     if p.running {
         return false;
     }
-    *p = Progress { running: true, step: "Démarrage".into(), done: 0, total: 0, error: None };
+    *p = Progress { running: true, step: "Démarrage".into(), done: 0, total: 0, error: None, warning: None };
     true
 }
 
-fn finish(result: &anyhow::Result<()>) {
+fn finish(result: &anyhow::Result<Option<String>>) {
     let mut p = PROGRESS.lock().unwrap();
     p.running = false;
     p.error = result.as_ref().err().map(|e| format!("{e:#}"));
-    p.step = if p.error.is_some() { "Échec".into() } else { "Terminé".into() };
+    p.warning = result.as_ref().ok().cloned().flatten();
+    p.step = if p.error.is_some() {
+        "Échec".into()
+    } else if p.warning.is_some() {
+        "Terminé avec des erreurs".into()
+    } else {
+        "Terminé".into()
+    };
 }
 
 /// Runs a sync in the background for the web UI; returns immediately.
@@ -59,197 +68,62 @@ pub fn spawn(pool: SqlitePool, full: bool) {
     }
     tokio::spawn(async move {
         let result = run_inner(&pool, full).await;
-        if let Err(err) = &result {
-            tracing::error!(?err, "sync failed");
+        match &result {
+            Err(err) => tracing::error!(?err, "sync failed"),
+            Ok(Some(warning)) => tracing::warn!(warning, "sync finished with errors"),
+            Ok(None) => {}
         }
         finish(&result);
     });
 }
 
-#[derive(FromRow)]
-struct SyncState {
-    last_sync_epoch: i64,
-    strava_refresh_token: Option<String>,
-}
-
-/// Fetches new Strava activities since the last sync, persists them and
-/// their raw streams, then runs deterministic metrics and segment matching.
-/// LLM bilan generation is NOT triggered here — it's on-demand from the
-/// activity detail page (`web::detail::regenerate_bilan`), so the user can
-/// add optional context before the first analysis instead of paying for an
-/// automatic one that ignores it.
+/// Synchronises every enabled and configured source (see `sources`), in
+/// priority order, then runs deterministic metrics and segment matching.
+/// An activity overlapping one already stored is ignored, so the first source
+/// to bring a ride wins. LLM bilan generation is NOT triggered here: it's
+/// on-demand from the activity detail page (`web::detail::regenerate_bilan`),
+/// so the user can add optional context before the first analysis.
 pub async fn run(pool: &SqlitePool) -> anyhow::Result<()> {
-    run_inner(pool, false).await
+    run_inner(pool, false).await.map(|_| ())
 }
 
-/// Like `run`, but ignores the stored last-sync timestamp and walks the whole
-/// Strava history, importing only activities not stored yet (e.g. runs, which
-/// were filtered out before running was supported). Strava's rate limit
-/// (100 requests / 15 min, ~3 requests per imported activity) can cut a big
-/// backfill short — the next call simply resumes with what's still missing.
+/// Like `run`, but ignores each source's last-sync marker and the list of
+/// ignored activities, walking the whole history for activities not stored yet
+/// (e.g. runs, which were filtered out before running was supported). Rate
+/// limits (Strava: 100 requests / 15 min, ~3 per imported activity) can cut a
+/// big backfill short: the next call resumes with what's still missing.
 pub async fn run_full(pool: &SqlitePool) -> anyhow::Result<()> {
-    run_inner(pool, true).await
+    run_inner(pool, true).await.map(|_| ())
 }
 
-async fn run_inner(pool: &SqlitePool, full: bool) -> anyhow::Result<()> {
+/// `Ok(Some(warning))`: finished, but some sources failed.
+async fn run_inner(pool: &SqlitePool, full: bool) -> anyhow::Result<Option<String>> {
     set_step("Chargement de la configuration", 0, 0);
-    let settings = crate::settings::fetch(pool).await?;
-
-    let state: Option<SyncState> = sqlx::query_as(
-        "SELECT last_sync_epoch, strava_refresh_token FROM sync_state WHERE id = 1",
-    )
-    .fetch_optional(pool)
-    .await?;
-
-    let last_sync_epoch = if full { 0 } else { state.as_ref().map(|s| s.last_sync_epoch).unwrap_or(0) };
-    let refresh_token = state.and_then(|s| s.strava_refresh_token).unwrap_or_default();
-
-    set_step("Authentification Strava", 0, 0);
-    let client = StravaClient::authenticate(
-        &settings.strava_client_id,
-        &settings.strava_client_secret,
-        &refresh_token,
-    )
-    .await?;
-
-    set_step("Récupération de la liste des activités Strava", 0, 0);
-    let fetched = client.list_activities_after(last_sync_epoch).await?;
-    tracing::info!(count = fetched.len(), "activities fetched from Strava");
-
-    // CyclAI covers road and indoor cycling and running — MTB/gravel, weight
-    // training etc. from the same Strava account must never enter the pipeline.
-    // sport_type (not the legacy `type` field) is what actually distinguishes
-    // GravelRide from Ride.
-    let activities: Vec<_> = fetched
-        .into_iter()
-        .filter(|a| crate::metrics::is_supported_sport(&a.sport_type))
-        .collect();
-    tracing::info!(count = activities.len(), "road rides and runs after filtering");
-
-    let total = activities.len();
-    let mut imported_ids: Vec<i64> = Vec::new();
-    for (i, activity) in activities.iter().enumerate() {
-        let label = format!("Activité {}/{} « {} »", i + 1, total, activity.name);
-        // Already fully imported (activity + streams): nothing to fetch.
-        let already_imported: Option<(i64,)> =
-            sqlx::query_as("SELECT activity_id FROM activity_streams WHERE activity_id = ?")
-                .bind(activity.id)
-                .fetch_optional(pool)
-                .await?;
-        if already_imported.is_some() {
-            continue;
-        }
-
-        imported_ids.push(activity.id);
-
-        // Power-based metrics (NP/TSS/IF/zones) are cycling-only and relative
-        // to the cycling FTP — a run's power (e.g. a foot pod) is ignored.
-        let is_ride = crate::metrics::is_ride(&activity.sport_type);
-        let normalized_power = activity
-            .weighted_average_watts
-            .filter(|_| is_ride && activity.device_watts.unwrap_or(false));
-        let avg_power = activity
-            .average_watts
-            .filter(|_| is_ride && activity.device_watts.unwrap_or(false));
-
-        // Only the title is free with the summary list already fetched above;
-        // the description needs its own per-activity detail call.
-        set_step(format!("{label} : description"), i, total);
-        let description = client.get_activity_description(activity.id).await?;
-
-        sqlx::query(
-            r#"
-            INSERT INTO activities
-                (id, started_at, sport_type, duration_s, distance_m, elevation_gain_m,
-                 avg_power_w, normalized_power_w, avg_hr, max_hr, title, description)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT (id) DO NOTHING
-            "#,
-        )
-        .bind(activity.id)
-        .bind(&activity.start_date)
-        .bind(&activity.sport_type)
-        .bind(activity.moving_time)
-        .bind(activity.distance)
-        .bind(activity.total_elevation_gain)
-        .bind(avg_power)
-        .bind(normalized_power)
-        .bind(activity.average_heartrate)
-        .bind(activity.max_heartrate)
-        .bind(&activity.name)
-        .bind(&description)
-        .execute(pool)
-        .await?;
-
-        set_step(format!("{label} : téléchargement des streams"), i, total);
-        let streams = client.get_streams(activity.id).await?;
-        set_step(format!("{label} : traitement des données"), i, total);
-        let streams_json = streams.to_string();
-        let streams_json_for_points = streams_json.clone();
-        // '' (not NULL) when there's no GPS data.
-        let route_thumb_svg = crate::route_thumb::compute(&streams_json).unwrap_or_default();
-        sqlx::query(
-            r#"
-            INSERT INTO activity_streams (activity_id, streams_json)
-            VALUES (?, ?)
-            ON CONFLICT (activity_id) DO UPDATE SET streams_json = excluded.streams_json
-            "#,
-        )
-        .bind(activity.id)
-        .bind(streams_json)
-        .execute(pool)
-        .await?;
-        let route_points = crate::route_thumb::compute_points(&streams_json_for_points).unwrap_or_default();
-        sqlx::query("UPDATE activities SET route_thumb_svg = ?, route_points_json = ? WHERE id = ?")
-            .bind(route_thumb_svg)
-            .bind(route_points)
-            .bind(activity.id)
-            .execute(pool)
-            .await?;
-        crate::bests::store(pool, activity.id, !is_ride, &streams).await?;
-
-        set_step(format!("{label} : tours"), i, total);
-        let laps = client.get_laps(activity.id).await?;
-        sqlx::query("DELETE FROM laps WHERE activity_id = ?")
-            .bind(activity.id)
-            .execute(pool)
-            .await?;
-        for lap in &laps {
-            let avg_power = lap.average_watts.filter(|_| is_ride && lap.device_watts.unwrap_or(false));
-            sqlx::query(
-                r#"
-                INSERT INTO laps (activity_id, lap_index, elapsed_time_s, distance_m, avg_power_w, avg_hr, max_hr)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-                "#,
-            )
-            .bind(activity.id)
-            .bind(lap.lap_index)
-            .bind(lap.elapsed_time)
-            .bind(lap.distance)
-            .bind(avg_power)
-            .bind(lap.average_heartrate)
-            .bind(lap.max_heartrate)
-            .execute(pool)
-            .await?;
-        }
+    let cfg = crate::sources::config(pool).await;
+    let sources = crate::sources::active_and_configured(pool).await;
+    if sources.is_empty() {
+        anyhow::bail!(
+            "aucune source d'activités n'est activée et configurée : active Strava ou Garmin dans Paramètres > Sources d'activités (l'import de fichiers .fit/.gpx reste disponible sur le tableau de bord)"
+        );
     }
 
-    set_step("Enregistrement de l'état de synchronisation", total, total);
-    let now = Utc::now().timestamp();
-    sqlx::query(
-        r#"
-        INSERT INTO sync_state (id, last_sync_epoch, strava_refresh_token)
-        VALUES (1, ?, ?)
-        ON CONFLICT (id) DO UPDATE SET
-            last_sync_epoch = excluded.last_sync_epoch,
-            strava_refresh_token = excluded.strava_refresh_token
-        "#,
-    )
-    .bind(now)
-    .bind(&client.refresh_token)
-    .execute(pool)
-    .await?;
+    let mut imported_ids: Vec<i64> = Vec::new();
+    let mut failures: Vec<String> = Vec::new();
+    let mut succeeded = 0;
+    for id in &sources {
+        match sync_source(pool, id, full, cfg.tolerance_s, &mut imported_ids).await {
+            Ok(()) => succeeded += 1,
+            Err(err) => {
+                tracing::error!(?err, source = %id, "source sync failed");
+                failures.push(format!("{} : {err:#}", crate::sources::label(id)));
+            }
+        }
+    }
+    if succeeded == 0 {
+        anyhow::bail!("{}", failures.join(" ; "));
+    }
 
+    let total = imported_ids.len();
     set_step("Calcul des métriques (TSS, CTL/ATL, zones)", total, total);
     // Only the activities imported just now need their streams re-parsed;
     // FTP/HR setting changes trigger the full recompute themselves.
@@ -263,5 +137,172 @@ async fn run_inner(pool: &SqlitePool, full: bool) -> anyhow::Result<()> {
         crate::segments::run(pool).await?;
     }
 
+    Ok((!failures.is_empty()).then(|| failures.join(" ; ")))
+}
+
+/// One source: list, skip what is known or overlaps, download and store the rest.
+async fn sync_source(pool: &SqlitePool, id: &str, full: bool, tolerance_s: i64, imported: &mut Vec<i64>) -> anyhow::Result<()> {
+    use crate::sources;
+    let label = sources::label(id);
+    set_step(format!("{label} : authentification"), 0, 0);
+    let Some(source) = sources::connect(id, pool).await? else {
+        anyhow::bail!("non configuré");
+    };
+
+    let result = import_from(pool, source.as_ref(), full, tolerance_s, imported).await;
+    // The token Strava rotated must be kept even when the import stopped midway.
+    source.finish(pool).await?;
+    result
+}
+
+async fn import_from(
+    pool: &SqlitePool,
+    source: &dyn crate::sources::ActivitySource,
+    full: bool,
+    tolerance_s: i64,
+    imported: &mut Vec<i64>,
+) -> anyhow::Result<()> {
+    use crate::sources;
+    let id = source.id();
+    let label = sources::label(id);
+    // Taken before listing: whatever starts during the run is picked up next time.
+    let started = Utc::now().timestamp();
+    let after = if full { 0 } else { sources::last_sync_epoch(pool, id).await };
+    if full {
+        sources::forget_ignored(pool, id).await?;
+    }
+
+    set_step(format!("{label} : récupération de la liste des activités"), 0, 0);
+    let listed = source.list(after).await?;
+
+    let total = listed.len();
+    for (i, l) in listed.iter().enumerate() {
+        let step = format!("{label} : activité {}/{} « {} »", i + 1, total, l.title);
+        if sources::is_known(pool, id, &l.external_id).await || sources::is_ignored(pool, id, &l.external_id).await {
+            continue;
+        }
+        // Duration known from the listing: no need to download an activity that
+        // an earlier (higher-priority) source already brought.
+        if let Some(d) = l.duration_s
+            && let Some(other) = sources::find_overlap(pool, l.start_epoch, d, tolerance_s).await
+        {
+            sources::record_ignored(pool, id, l, other).await?;
+            continue;
+        }
+        set_step(format!("{step} : téléchargement"), i, total);
+        let Some(activity) = source.fetch(l).await? else { continue };
+        if l.duration_s.is_none()
+            && let Some(other) = sources::find_overlap(pool, l.start_epoch, activity.duration_s, tolerance_s).await
+        {
+            sources::record_ignored(pool, id, l, other).await?;
+            continue;
+        }
+        set_step(format!("{step} : enregistrement"), i, total);
+        imported.push(sources::insert(pool, &activity).await?);
+    }
+
+    set_step("Enregistrement de l'état de synchronisation", total, total);
+    sources::set_last_sync_epoch(pool, id, started).await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sources::{ActivitySource, Listed, NewActivity};
+    use sqlx::sqlite::SqlitePoolOptions;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// A plugin with a fixed listing; counts downloads.
+    struct Fake {
+        listed: Vec<Listed>,
+        downloads: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl ActivitySource for Fake {
+        fn id(&self) -> &'static str {
+            "garmin"
+        }
+        async fn list(&self, _after: i64) -> anyhow::Result<Vec<Listed>> {
+            Ok(self.listed.clone())
+        }
+        async fn fetch(&self, l: &Listed) -> anyhow::Result<Option<NewActivity>> {
+            self.downloads.fetch_add(1, Ordering::SeqCst);
+            Ok(Some(NewActivity {
+                source: "garmin",
+                external_id: Some(l.external_id.clone()),
+                started_at: l.started_at.clone(),
+                sport_type: "Ride".into(),
+                duration_s: l.duration_s.unwrap_or(3600),
+                distance_m: 1000.0,
+                elevation_gain_m: 0.0,
+                avg_power_w: None,
+                normalized_power_w: None,
+                avg_hr: None,
+                max_hr: None,
+                title: l.title.clone(),
+                description: None,
+                streams: serde_json::json!({"time": {"data": [0, 1]}}),
+                laps: vec![],
+            }))
+        }
+    }
+
+    fn listed(id: &str, start: &str, duration_s: Option<i64>) -> Listed {
+        Listed {
+            external_id: id.into(),
+            title: format!("ride {id}"),
+            started_at: start.into(),
+            start_epoch: crate::sources::epoch_of(start).unwrap(),
+            duration_s,
+            sport_type: "Ride".into(),
+            raw: serde_json::Value::Null,
+        }
+    }
+
+    #[tokio::test]
+    async fn an_overlapping_activity_is_ignored_once_and_never_downloaded_again() {
+        let pool = SqlitePoolOptions::new().connect("sqlite::memory:").await.unwrap();
+        crate::db::migrate(&pool).await.unwrap();
+        // A ride already stored (say from an earlier file import), 08:00-09:00.
+        sqlx::query("INSERT INTO activities (id, started_at, duration_s, distance_m, elevation_gain_m, source) VALUES (-1, '2026-11-10T08:00:00Z', 3600, 1, 0, 'file')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let fake = Fake {
+            listed: vec![
+                // Same ride, 4 s later: ignored before any download (duration known).
+                listed("dup", "2026-11-10T08:00:04Z", Some(3590)),
+                // Same ride, duration unknown from the listing: downloaded, then ignored.
+                listed("dup2", "2026-11-10T08:00:02Z", None),
+                // Next ride, starting as the first one ends: kept.
+                listed("next", "2026-11-10T09:00:00Z", Some(1800)),
+            ],
+            downloads: AtomicUsize::new(0),
+        };
+        let mut imported = Vec::new();
+        import_from(&pool, &fake, false, 10, &mut imported).await.unwrap();
+        assert_eq!(imported.len(), 1, "only the non-overlapping ride");
+        assert_eq!(fake.downloads.load(Ordering::SeqCst), 2, "dup was skipped without a download");
+        for id in ["dup", "dup2"] {
+            assert!(crate::sources::is_ignored(&pool, "garmin", id).await, "{id}");
+        }
+        assert!(crate::sources::is_known(&pool, "garmin", "next").await);
+
+        // A second run changes nothing and downloads nothing.
+        let mut again = Vec::new();
+        import_from(&pool, &fake, false, 10, &mut again).await.unwrap();
+        assert!(again.is_empty());
+        assert_eq!(fake.downloads.load(Ordering::SeqCst), 2);
+
+        // A full sync reconsiders the ignored ones (here still overlapping: ignored again).
+        import_from(&pool, &fake, true, 10, &mut again).await.unwrap();
+        assert!(again.is_empty());
+        assert_eq!(fake.downloads.load(Ordering::SeqCst), 3, "dup2 is downloaded again, dup is not");
+
+        // A bigger tolerance lets the 4 s overlap through on a full sync.
+        import_from(&pool, &fake, true, 7200, &mut again).await.unwrap();
+        assert_eq!(again.len(), 2, "with a huge tolerance nothing overlaps");
+    }
 }

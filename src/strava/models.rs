@@ -1,4 +1,4 @@
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Deserialize)]
 pub struct TokenResponse {
@@ -8,7 +8,7 @@ pub struct TokenResponse {
 }
 
 /// Subset of Strava's SummaryActivity we actually persist.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct SummaryActivity {
     pub id: i64,
     /// The athlete-entered (or device-default) activity title — free with
