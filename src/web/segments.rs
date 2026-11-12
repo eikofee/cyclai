@@ -1,5 +1,5 @@
-//! `/segments`: the reference segments synced from Strava favourites, with a
-//! button to (re)import them. Selecting one (`?id=`) shows its latest
+//! `/segments`: the reference segments, each imported from a GPX file of its
+//! track (first point = start, last point = end). Selecting one (`?id=`) shows its latest
 //! efforts (time, power, …), its position on a map and its elevation
 //! profile. Segment geometry isn't stored — only start/end points are — so
 //! the track and profile are sliced from the streams of a recent effort.
@@ -22,11 +22,32 @@ pub async fn page(State(state): State<AppState>, Query(q): Query<SegmentsQuery>)
     Html(render(&state, q.id, None).await)
 }
 
-pub async fn import(State(state): State<AppState>) -> Response {
-    match crate::segments::import_starred(&state.pool).await {
-        Ok(()) => Redirect::to("/segments").into_response(),
+/// `POST /segments/import` — a segment from a GPX file (+ an optional name).
+pub async fn import(State(state): State<AppState>, mut multipart: axum::extract::Multipart) -> Response {
+    let (mut name, mut file_name, mut bytes) = (String::new(), None, None);
+    while let Ok(Some(field)) = multipart.next_field().await {
+        match field.name() {
+            Some("name") => name = field.text().await.unwrap_or_default(),
+            Some("file") => {
+                file_name = field.file_name().map(str::to_string);
+                bytes = field.bytes().await.ok();
+            }
+            _ => {}
+        }
+    }
+    let Some(bytes) = bytes.filter(|b| !b.is_empty()) else {
+        return Html(render(&state, None, Some("Choisis un fichier GPX.")).await).into_response();
+    };
+    // Without a name, the file's (minus its extension) is used.
+    let name = if name.trim().is_empty() {
+        file_name.as_deref().map(|f| f.rsplit_once('.').map(|(stem, _)| stem).unwrap_or(f).to_string()).unwrap_or_default()
+    } else {
+        name
+    };
+    match crate::segments::import_gpx(&state.pool, &name, &bytes).await {
+        Ok(id) => Redirect::to(&format!("/segments?id={id}")).into_response(),
         Err(err) => {
-            tracing::warn!(?err, "starred segments import failed");
+            tracing::warn!(?err, "segment import failed");
             Html(render(&state, None, Some(&format!("Import impossible : {err}"))).await).into_response()
         }
     }
@@ -180,7 +201,7 @@ async fn render(state: &AppState, selected: Option<i64>, error: Option<&str>) ->
         .unwrap_or_default();
 
     let list_html = if segments.is_empty() {
-        r#"<p class="hint">Aucun segment synchronisé. Mets tes segments en favoris sur Strava puis clique sur « Importer depuis Strava ».</p>"#
+        r#"<p class="hint">Aucun segment. Importe le tracé d'un segment au format GPX avec le bouton ci-dessus.</p>"#
             .to_string()
     } else {
         let body: String = segments
@@ -213,17 +234,21 @@ async fn render(state: &AppState, selected: Option<i64>, error: Option<&str>) ->
         None => String::new(),
     };
 
-    let actions = r#"<form method="post" action="/segments/import" onsubmit="var b=this.querySelector('button');b.disabled=true;b.textContent='Import en cours…'"><button type="submit">Importer depuis Strava</button></form>"#;
+    let actions = r#"<form method="post" action="/segments/import" enctype="multipart/form-data" onsubmit="var b=this.querySelector('button');b.disabled=true;b.textContent='Import en cours…'">
+  <input type="file" name="file" accept=".gpx" required>
+  <input type="text" name="name" placeholder="Nom (sinon celui du fichier)" maxlength="100">
+  <button type="submit">Importer un segment (GPX)</button>
+</form>"#;
     let body = format!(
         r#"{header}
 {error_html}
 <section>
-<h2>Segments synchronisés</h2>
+<h2>Segments de référence</h2>
 {list_html}
-<p class="hint">Seuls les segments en favoris sur Strava sont importés (coordonnées de départ et d'arrivée) ; les passages sont détectés par CyclAI sur tes sorties vélo avec capteur de puissance. L'import relance la détection sur toutes les sorties et peut prendre un moment.</p>
+<p class="hint">Un segment s'importe depuis un fichier GPX de son tracé : le premier point est le départ, le dernier l'arrivée (une boucle doit être coupée en deux). Réimporter un segment du même nom le met à jour. Les passages sont détectés par CyclAI sur tes sorties vélo avec capteur de puissance ; l'import relance la détection sur toutes les sorties et peut prendre un moment.</p>
 </section>
 {detail_html}"#,
-        header = layout::page_header("Segments", "Tes segments favoris et tes derniers passages dessus.", actions),
+        header = layout::page_header("Segments", "Tes segments de référence et tes derniers passages dessus.", actions),
     );
 
     let head = r#"<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" crossorigin="" />

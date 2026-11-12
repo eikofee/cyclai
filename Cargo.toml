@@ -3,6 +3,9 @@ name = "cyclai"
 version = "0.1.0"
 edition = "2024"
 
+[workspace]
+members = ["plugin-sdk"]
+
 [dependencies]
 axum = { version = "0.8", features = ["multipart"] }
 tokio = { version = "1", features = ["full"] }
@@ -28,6 +31,8 @@ sha2 = "0.10"
 base64 = "0.22"
 rand = "0.8"
 async-trait = "0.1"
+cyclai-plugin-sdk = { path = "plugin-sdk", features = ["client"] }
 zip = { version = "2", default-features = false, features = ["deflate"] }
 
 [dev-dependencies]
+cyclai-plugin-sdk = { path = "plugin-sdk", features = ["client", "server"] }

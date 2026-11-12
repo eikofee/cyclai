@@ -30,9 +30,13 @@ struct ActivityDetailRow {
     streams_json: Option<String>,
     user_context: Option<String>,
     description: Option<String>,
+    source: String,
+    external_id: Option<String>,
 }
 
 struct ActivityDetail {
+    /// Link to the activity on its source's own site (given by the plugin).
+    source_link: Option<(String, String)>,
     is_run: bool,
     started_at: String,
     distance_m: f64,
@@ -88,7 +92,7 @@ async fn fetch_activity(pool: &SqlitePool, id: i64) -> anyhow::Result<Option<Act
         SELECT a.sport_type, a.started_at, a.distance_m, a.duration_s, a.elevation_gain_m,
                a.avg_power_w, a.normalized_power_w, a.avg_hr, a.max_hr, a.tss, a.intensity_factor,
                a.zone1_s, a.zone2_s, a.zone3_s, a.zone4_s, a.zone5_s, a.zone6_s, a.zone7_s,
-               b.text AS bilan, s.streams_json, a.user_context, a.description
+               b.text AS bilan, s.streams_json, a.user_context, a.description, a.source, a.external_id
         FROM activities a
         LEFT JOIN activity_bilans b ON b.activity_id = a.id
         LEFT JOIN activity_streams s ON s.activity_id = a.id
@@ -99,7 +103,9 @@ async fn fetch_activity(pool: &SqlitePool, id: i64) -> anyhow::Result<Option<Act
     .fetch_optional(pool)
     .await?;
 
+    let templates = crate::sources::link_templates(pool).await;
     Ok(row.map(|r| ActivityDetail {
+        source_link: crate::sources::activity_link(&templates, &r.source, r.external_id.as_deref()),
         is_run: crate::metrics::is_run(&r.sport_type),
         started_at: r.started_at,
         distance_m: r.distance_m,
@@ -196,7 +202,7 @@ async fn fetch_segment_curve(
     Ok(Some(SegmentCurve { distance_km, power, hr }))
 }
 
-/// Only meaningful with >1 row — Strava always returns at least one lap
+/// Only meaningful with >1 row — a source always returns at least one lap
 /// (the whole ride) even with no manual laps pressed.
 async fn fetch_laps(pool: &SqlitePool, activity_id: i64) -> anyhow::Result<Vec<LapRow>> {
     let rows: Vec<(i64, i64, f64, Option<f64>, Option<f64>)> = sqlx::query_as(
@@ -239,7 +245,7 @@ fn downsample_indices(n: usize, max_points: usize) -> Vec<usize> {
 }
 
 /// Samples `arr` at `indices`, clamping to the last known value if `arr` is
-/// shorter than expected (shouldn't happen — Strava's parallel streams are
+/// shorter than expected (shouldn't happen — the sources' parallel streams are
 /// normally all the same length — but keeps this defensive rather than
 /// panicking on a malformed stream).
 fn pick(arr: Option<&[f64]>, indices: &[usize]) -> Option<Vec<f64>> {
@@ -253,8 +259,8 @@ fn pick(arr: Option<&[f64]>, indices: &[usize]) -> Option<Vec<f64>> {
 
 /// Looks up the distance (m) covered at a given elapsed-time offset, via the
 /// nearest sample in `time` (assumed sorted ascending) — used to convert a
-/// lap's cumulative-elapsed-time boundary (from the Strava laps API, which
-/// only gives durations) into a distance-km boundary for the distance-based
+/// lap's cumulative-elapsed-time boundary (from the source's laps, which
+/// only give durations) into a distance-km boundary for the distance-based
 /// chart's x-axis.
 fn distance_at_time_s(time: &[f64], distance: &[f64], t_s: f64) -> f64 {
     let idx = time.partition_point(|&t| t < t_s).min(time.len().saturating_sub(1));
@@ -713,8 +719,8 @@ fn render_hr_zone_bar(zone_secs: &[i64; 5], hr_rest: f64, hr_max: f64) -> String
 }
 
 /// Best average power over standard durations — a rolling-window max via
-/// prefix sums, O(n) per duration. Assumes near-1Hz sampling (Strava's
-/// time-based streams normally are), so "duration in seconds" ≈ "window in
+/// prefix sums, O(n) per duration. Assumes near-1Hz sampling (time-based
+/// streams normally are), so "duration in seconds" ≈ "window in
 /// samples" — good enough for a first cut, not exact for gappy streams.
 fn power_curve(watts: &[f64]) -> Vec<(i64, f64)> {
     const DURATIONS_S: [i64; 7] = [5, 15, 30, 60, 300, 600, 1200];
@@ -1025,7 +1031,7 @@ pub async fn activity_detail(
                 cursor_s += l.elapsed_time_s;
                 let end_km = distance_at_time_s(&time, distance.as_deref().unwrap_or(&[]), cursor_s as f64) / 1000.0;
                 // Position in the sorted list, matching LAP_ZONES — the stored
-                // `lap_index` is 0-based from Strava but 1-based from imports.
+                // `lap_index` is 0-based from plugins but 1-based from file imports.
                 let lap_index = pos + 1;
                 format!(
                     "<tr class=\"lap-row\" \
@@ -1139,7 +1145,7 @@ pub async fn activity_detail(
         button_label = if activity.bilan.is_some() { "Régénérer le bilan avec ce contexte" } else { "Générer le bilan" },
     );
 
-    // Editable in the UI (not just synced from Strava) since a GPX/FIT
+    // Editable in the UI (not just synced from a source) since a GPX/FIT
     // import never carries a description — see importer::ParsedActivity.
     let description_form_html = format!(
         "<form method=\"post\" action=\"/activity/{id}/description\" class=\"context-form\">\
@@ -1161,13 +1167,12 @@ pub async fn activity_detail(
         format!("{llm_notice_html}{description_form_html}{context_form_html}")
     };
 
-    // Imported (GPX/FIT) activities use negative ids (see web::import) —
-    // there's no matching Strava activity to link to for those.
-    let strava_link_html = if id > 0 {
-        format!(r#"<p><a href="https://www.strava.com/activities/{id}" target="_blank" rel="noopener">voir sur Strava ↗</a></p>"#)
-    } else {
-        String::new()
-    };
+    // Only what a plugin gave a link template for (a file import has none).
+    let source_link_html = activity
+        .source_link
+        .as_ref()
+        .map(|(url, label)| format!(r#"<p><a href="{}" target="_blank" rel="noopener noreferrer">{} ↗</a></p>"#, escape_html(url), escape_html(label)))
+        .unwrap_or_default();
 
     let stat_row = |label: &str, value: String| format!("<div class=\"stat\"><div class=\"value\">{value}</div><div class=\"label\">{label}</div></div>");
     let stats_html = [
@@ -1214,7 +1219,7 @@ pub async fn activity_detail(
 <div class="stats">{stats_html}</div>
 {bilan_html}
 {edit_html}
-{strava_link_html}
+{source_link_html}
 </section>
 
 <section>
@@ -1315,7 +1320,7 @@ pub struct DescriptionForm {
 
 /// GPX/FIT imports never carry a description (see `importer::ParsedActivity`
 /// doc comment) — this is how they get one, and it also lets a
-/// Strava-synced description be corrected by hand.
+/// synced description be corrected by hand.
 pub async fn update_description(
     State(state): State<AppState>,
     Path(id): Path<i64>,

@@ -10,9 +10,6 @@ use std::env;
 #[derive(Clone)]
 pub struct Config {
     pub database_url: String,
-    pub strava_client_id: String,
-    pub strava_client_secret: String,
-    pub strava_refresh_token: String,
     pub anthropic_api_key: String,
     pub ftp_watts: u32,
     pub hr_max: u32,
@@ -26,9 +23,6 @@ impl Config {
 
         Ok(Self {
             database_url: env::var("DATABASE_URL").unwrap_or_else(|_| "sqlite://cyclai.db".into()),
-            strava_client_id: env::var("STRAVA_CLIENT_ID").unwrap_or_default(),
-            strava_client_secret: env::var("STRAVA_CLIENT_SECRET").unwrap_or_default(),
-            strava_refresh_token: env::var("STRAVA_REFRESH_TOKEN").unwrap_or_default(),
             anthropic_api_key: env::var("ANTHROPIC_API_KEY").unwrap_or_default(),
             ftp_watts: env::var("FTP_WATTS")
                 .unwrap_or_else(|_| "200".into())

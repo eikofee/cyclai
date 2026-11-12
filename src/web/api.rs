@@ -168,7 +168,7 @@ const ACTIVITY_COLUMNS: &str = "id, sport_type, started_at, title, distance_m, d
 
 /// Where the power figures come from: `none` (no power meter data kept),
 /// `trainer` (indoor ride — smart trainer) or `pedals` (outdoor power meter).
-/// Strava only exposes `device_watts`, so this is derived from the sport type.
+/// Sources only say whether power comes from a device, so this is derived from the sport type.
 fn power_source(a: &ActivityRecord) -> &'static str {
     match (a.avg_power_w.is_some(), a.sport_type == "VirtualRide") {
         (false, _) => "none",
@@ -270,7 +270,7 @@ pub(super) async fn activity(State(state): State<AppState>, Path(id): Path<i64>)
     .fetch_all(&state.pool)
     .await?;
 
-    // Raw streams give per-lap and whole-ride detail beyond what Strava's
+    // Raw streams give per-lap and whole-ride detail beyond what a source's
     // lap summary carries; without them (rare) laps fall back to the stored
     // summary values and `performance` is null.
     let ath = current_athlete(&state.pool).await?;
@@ -1538,7 +1538,7 @@ fn lap_json(
         "intensity_factor": opt_round(np.map(|np| np / ftp), 2),
         "avg_hr": opt_round(stats.and_then(|s| s.avg_hr).or(stored_hr), 0),
         "max_hr": opt_round(stats.and_then(|s| s.max_hr), 0),
-        // Strava reports running cadence per leg: x2 gives steps per minute.
+        // Sources report running cadence per leg: x2 gives steps per minute.
         "avg_cadence_rpm": if is_run { None } else { opt_round(cadence, 0) },
         "avg_cadence_spm": if is_run { opt_round(cadence.map(|c| c * 2.0), 0) } else { None },
         "elevation_gain_m": opt_round(stats.and_then(|s| s.elevation_gain_m), 0),

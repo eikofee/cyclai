@@ -1,4 +1,3 @@
-use crate::strava::StravaClient;
 use sqlx::SqlitePool;
 
 /// Distance under which a GPS point counts as "at" a segment endpoint.
@@ -7,56 +6,61 @@ use sqlx::SqlitePool;
 /// enough to avoid cross-matching nearby segments.
 const MATCH_THRESHOLD_M: f64 = 15.0;
 
-/// Fetches the user's starred Strava segments and upserts their coordinates
-/// into `reference_segments`. Starring the segment is a manual step on
-/// Strava's side (see README) — this only pulls coordinates, never uses
-/// Strava's own effort/segment_efforts calculations.
-pub async fn import_starred(pool: &SqlitePool) -> anyhow::Result<()> {
-    let settings = crate::settings::fetch(pool).await?;
-    let refresh_token: Option<String> =
-        sqlx::query_scalar::<_, Option<String>>("SELECT strava_refresh_token FROM sync_state WHERE id = 1")
-            .fetch_optional(pool)
-            .await?
-            .flatten();
+/// Smallest distance between a segment's start and end: the detection looks
+/// for a ride passing near both ends, so they must be told apart.
+const MIN_SEGMENT_ENDS_M: f64 = 2.0 * MATCH_THRESHOLD_M;
+const MIN_SEGMENT_LENGTH_M: f64 = 100.0;
 
-    let client = StravaClient::authenticate(
-        &settings.strava_client_id,
-        &settings.strava_client_secret,
-        &refresh_token.unwrap_or_default(),
+/// Creates (or updates, by name) a reference segment from a GPX file: its
+/// start and end are the first and last points of the track. Returns its id.
+/// The detection then runs again over every stored ride.
+pub async fn import_gpx(pool: &SqlitePool, name: &str, gpx: &[u8]) -> anyhow::Result<i64> {
+    let name: String = name.chars().filter(|c| !c.is_control()).take(100).collect();
+    let name = name.trim();
+    anyhow::ensure!(!name.is_empty(), "le segment a besoin d'un nom");
+    let parsed = crate::importer::parse_gpx(gpx)?;
+    let points = parsed.streams_json["latlng"]["data"].as_array().cloned().unwrap_or_default();
+    let point = |p: Option<&serde_json::Value>| -> Option<(f64, f64)> {
+        let p = p?.as_array()?;
+        Some((p.first()?.as_f64()?, p.get(1)?.as_f64()?))
+    };
+    let (Some((slat, slng)), Some((elat, elng))) = (point(points.first()), point(points.last())) else {
+        anyhow::bail!("le GPX ne contient pas de trace exploitable");
+    };
+    anyhow::ensure!(
+        parsed.distance_m >= MIN_SEGMENT_LENGTH_M,
+        "segment trop court ({:.0} m) : il fait au moins {MIN_SEGMENT_LENGTH_M:.0} m",
+        parsed.distance_m
+    );
+    anyhow::ensure!(
+        haversine_m(slat, slng, elat, elng) >= MIN_SEGMENT_ENDS_M,
+        "le départ et l'arrivée sont trop proches (boucle ?) : la détection a besoin de les distinguer, coupe la boucle en deux segments"
+    );
+    sqlx::query(
+        r#"
+        INSERT INTO reference_segments (name, start_lat, start_lng, end_lat, end_lng, distance_m, elevation_gain_m)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT (name) DO UPDATE SET
+            start_lat = excluded.start_lat, start_lng = excluded.start_lng,
+            end_lat = excluded.end_lat, end_lng = excluded.end_lng,
+            distance_m = excluded.distance_m, elevation_gain_m = excluded.elevation_gain_m
+        "#,
     )
+    .bind(name)
+    .bind(slat)
+    .bind(slng)
+    .bind(elat)
+    .bind(elng)
+    .bind(parsed.distance_m)
+    .bind(parsed.elevation_gain_m)
+    .execute(pool)
     .await?;
-
-    let segments = client.list_starred_segments().await?;
-    tracing::info!(count = segments.len(), "starred segments fetched");
-
-    for seg in &segments {
-        sqlx::query(
-            r#"
-            INSERT INTO reference_segments
-                (name, start_lat, start_lng, end_lat, end_lng, distance_m, elevation_gain_m)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT (name) DO UPDATE SET
-                start_lat = excluded.start_lat, start_lng = excluded.start_lng,
-                end_lat = excluded.end_lat, end_lng = excluded.end_lng,
-                distance_m = excluded.distance_m, elevation_gain_m = excluded.elevation_gain_m
-            "#,
-        )
-        .bind(&seg.name)
-        .bind(seg.start_latlng[0])
-        .bind(seg.start_latlng[1])
-        .bind(seg.end_latlng[0])
-        .bind(seg.end_latlng[1])
-        .bind(seg.distance)
-        .bind(seg.elevation_high - seg.elevation_low)
-        .execute(pool)
-        .await?;
-    }
+    let id: i64 = sqlx::query_scalar("SELECT id FROM reference_segments WHERE name = ?").bind(name).fetch_one(pool).await?;
 
     // The sync skips matching when nothing new was imported, so match the
-    // existing rides against the (possibly new) segments right away.
+    // existing rides against the (possibly new) segment right away.
     run(pool).await?;
-
-    Ok(())
+    Ok(id)
 }
 
 fn haversine_m(lat1: f64, lng1: f64, lat2: f64, lng2: f64) -> f64 {
@@ -400,5 +404,46 @@ mod tests {
         assert!((rows[1].2.unwrap() - 10.0).abs() < 1e-9);
         assert!((rows[1].3.unwrap() - 10.0).abs() < 1e-9);
         assert!((rows[1].4.unwrap() - 10.0).abs() < 1e-9);
+    }
+
+    fn gpx(points: &[(f64, f64)]) -> Vec<u8> {
+        let pts: String = points.iter().map(|(la, lo)| format!(r#"<trkpt lat="{la}" lon="{lo}"><ele>200</ele></trkpt>"#)).collect();
+        format!(r#"<?xml version="1.0"?><gpx version="1.1" creator="t" xmlns="http://www.topografix.com/GPX/1/1"><trk><trkseg>{pts}</trkseg></trk></gpx>"#).into_bytes()
+    }
+
+    #[tokio::test]
+    async fn a_segment_is_imported_from_a_gpx_track_and_updated_by_name() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new().connect("sqlite::memory:").await.unwrap();
+        crate::db::migrate(&pool).await.unwrap();
+        // About 555 m northwards.
+        let track: Vec<(f64, f64)> = (0..6).map(|i| (45.0 + i as f64 * 0.001, 5.0)).collect();
+        let id = import_gpx(&pool, " Col du test ", &gpx(&track)).await.unwrap();
+        let (name, slat, elat, dist): (String, f64, f64, f64) =
+            sqlx::query_as("SELECT name, start_lat, end_lat, distance_m FROM reference_segments WHERE id = ?").bind(id).fetch_one(&pool).await.unwrap();
+        assert_eq!(name, "Col du test");
+        assert!((slat - 45.0).abs() < 1e-9 && (elat - 45.005).abs() < 1e-9);
+        assert!((dist - 556.0).abs() < 10.0, "{dist}");
+
+        // Same name: updated, not duplicated.
+        let again = import_gpx(&pool, "Col du test", &gpx(&track[..4])).await.unwrap();
+        assert_eq!(again, id);
+        let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM reference_segments").fetch_one(&pool).await.unwrap();
+        assert_eq!(n, 1);
+    }
+
+    #[tokio::test]
+    async fn unusable_segment_tracks_are_refused_with_a_reason() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new().connect("sqlite::memory:").await.unwrap();
+        crate::db::migrate(&pool).await.unwrap();
+        let short = import_gpx(&pool, "court", &gpx(&[(45.0, 5.0), (45.0003, 5.0)])).await.unwrap_err().to_string();
+        assert!(short.contains("trop court"), "{short}");
+        // A loop: starts and ends at the same place.
+        let ring = [(45.0, 5.0), (45.002, 5.0), (45.002, 5.002), (45.0, 5.002), (45.0, 5.0)];
+        let lp = import_gpx(&pool, "boucle", &gpx(&ring)).await.unwrap_err().to_string();
+        assert!(lp.contains("trop proches"), "{lp}");
+        assert!(import_gpx(&pool, "  ", &gpx(&[(45.0, 5.0), (45.01, 5.0)])).await.is_err(), "a name is required");
+        assert!(import_gpx(&pool, "x", b"not a gpx").await.is_err());
+        let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM reference_segments").fetch_one(&pool).await.unwrap();
+        assert_eq!(n, 0, "nothing stored on refusal");
     }
 }

@@ -33,5 +33,11 @@ services:
     volumes:
       - cyclai-data:/data
 
+# Plugins d'activités (par exemple Garmin) : un conteneur chacun, sans port publié.
+# Exemple dans le dépôt de chaque plugin ; puis, sur cyclai-ui :
+#   CYCLAI_PLUGINS=garmin=http://garmin:8080
+#   CYCLAI_PLUGIN_GARMIN_SECRET=<le même secret que le plugin>
+# Voir docs/PLUGINS.md.
+
 volumes:
   cyclai-data:

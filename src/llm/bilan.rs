@@ -221,7 +221,7 @@ fn format_deltas(d: &ActivityDeltas) -> String {
             out += "\n";
         }
     }
-    // A Strava activity always has at least 1 lap (the whole ride) even
+    // An activity from a plugin always has at least 1 lap (the whole ride) even
     // with no manual laps pressed — only worth showing when there's an
     // actual structured breakdown to analyze.
     if d.laps.len() > 1 {
@@ -254,15 +254,15 @@ fn build_user_message(d: &ActivityDeltas, profile: &str) -> String {
                 pour les sorties à pied : commente l'allure (min/km), la régularité, la FC et le dénivelé, et ignore les \
                 références au vélo de la consigne.\n";
     }
-    // Strava's own title is often meaningful even when generic ("Morning
+    // The source's own title is often meaningful even when generic ("Morning
     // Ride" tells you nothing, but the athlete sometimes renames it e.g.
-    // "Sortie difficile, jambes lourdes") — always non-empty from Strava,
+    // "Sortie difficile, jambes lourdes") — always non-empty from a source,
     // so no blank-filter needed unlike description/user_context.
     if let Some(title) = d.title.as_deref() {
-        out += &format!("\nTitre Strava de la sortie: \"{title}\"\n");
+        out += &format!("\nTitre de la sortie: \"{title}\"\n");
     }
     if let Some(desc) = d.description.as_deref().filter(|c| !c.trim().is_empty()) {
-        out += &format!("\nDescription Strava écrite par le cycliste:\n{}\n", desc.trim());
+        out += &format!("\nDescription écrite par le cycliste:\n{}\n", desc.trim());
     }
     if let Some(ctx) = d.user_context.as_deref().filter(|c| !c.trim().is_empty()) {
         out += &format!(
@@ -274,7 +274,7 @@ fn build_user_message(d: &ActivityDeltas, profile: &str) -> String {
 }
 
 /// The user message the LLM receives for one activity (profile + deltas +
-/// Strava title/description + user context). Used by the downloadable
+/// source title/description + user context). Used by the downloadable
 /// no-API report so a chat assistant is fed exactly what the API would be.
 pub async fn build_activity_message(pool: &SqlitePool, activity_id: i64, profile: &str) -> anyhow::Result<String> {
     let deltas = fetch_activity_deltas(pool, activity_id).await?;
@@ -397,7 +397,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn includes_strava_title_and_description_when_present() {
+    async fn includes_title_and_description_when_present() {
         let pool = test_pool().await;
         sqlx::query("INSERT INTO athlete_config (id, ftp_watts, hr_max, hr_rest) VALUES (1, 205, 192, 53)")
             .execute(&pool)
@@ -414,7 +414,7 @@ mod tests {
         let client = FakeClient { calls: Mutex::new(Vec::new()), response: "ok".to_string() };
         generate_activity_bilans(&pool, &client, &[1], TEST_PROFILE, DEFAULT_SYSTEM_PROMPT).await.unwrap();
         let msg = &client.calls.lock().unwrap()[0].1;
-        assert!(msg.contains("Titre Strava de la sortie: \"Sortie difficile, jambes lourdes\""));
+        assert!(msg.contains("Titre de la sortie: \"Sortie difficile, jambes lourdes\""));
         assert!(msg.contains("Grosse chaleur aujourd'hui, 34°C"));
     }
 

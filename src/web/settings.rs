@@ -53,14 +53,6 @@ async fn render_page(pool: &sqlx::SqlitePool, error: Option<&str>) -> Html<Strin
             return Html(page_shell("<p>Impossible de charger les paramètres.</p>"));
         }
     };
-    let strava_refresh_token: Option<String> =
-        sqlx::query_scalar::<_, Option<String>>("SELECT strava_refresh_token FROM sync_state WHERE id = 1")
-            .fetch_optional(pool)
-            .await
-            .ok()
-            .flatten()
-            .flatten();
-
     let rules = crate::rules::Rules::load(pool).await.unwrap_or_default();
     let (ftp_watts, hr_max, hr_rest, lthr, hr_tss_coef, run_pace_s): (i64, i64, i64, i64, f64, i64) = sqlx::query_as(
         "SELECT ftp_watts, hr_max, hr_rest, lthr, hr_tss_coef, run_threshold_pace_s FROM athlete_config WHERE id = 1",
@@ -113,11 +105,16 @@ async fn render_page(pool: &sqlx::SqlitePool, error: Option<&str>) -> Html<Strin
     };
 
     let source_cfg = crate::sources::config(pool).await;
+    let plugin_status = crate::sources::statuses(pool).await;
     let mut source_rows = String::new();
     for (i, id) in source_cfg.order.iter().enumerate() {
-        let configured = crate::sources::is_configured(pool, id).await;
         let enabled = source_cfg.enabled.contains(id);
-        let badge = if configured { "identifiants renseignés" } else { "à configurer" };
+        let (badge, detail) = match plugin_status.get(id) {
+            Some(Ok(m)) if m.configured => ("prêt".to_string(), String::new()),
+            Some(Ok(m)) => ("à configurer".to_string(), m.message.clone().unwrap_or_default()),
+            Some(Err(e)) => ("injoignable".to_string(), e.clone()),
+            None => ("injoignable".to_string(), String::new()),
+        };
         let up = if i > 0 { format!(r#"<button type="submit" name="move" value="{id}:up" class="secondary" title="Monter" aria-label="Monter">↑</button>"#) } else { String::new() };
         let down = if i + 1 < source_cfg.order.len() {
             format!(r#"<button type="submit" name="move" value="{id}:down" class="secondary" title="Descendre" aria-label="Descendre">↓</button>"#)
@@ -126,14 +123,24 @@ async fn render_page(pool: &sqlx::SqlitePool, error: Option<&str>) -> Html<Strin
         };
         source_rows.push_str(&format!(
             r#"<div class="source-row"><span><strong>{rank}.</strong></span>
-  <label class="grow"><input type="checkbox" name="enabled" value="{id}"{checked}> {label} <span class="badge">{badge}</span></label>
+  <label class="grow"><input type="checkbox" name="enabled" value="{id}"{checked}> {label} <span class="badge">{badge}</span>{detail}</label>
   <input type="hidden" name="order" value="{id}">{up}{down}</div>
 "#,
             rank = i + 2,
-            label = crate::sources::label(id),
+            id = escape_html(id),
+            label = escape_html(&crate::sources::label(id)),
             checked = if enabled { " checked" } else { "" },
+            detail = if detail.is_empty() { String::new() } else { format!(r#" <span class="hint">{}</span>"#, escape_html(&detail)) },
         ));
     }
+    let no_plugins = if source_cfg.order.is_empty() {
+        r#"<p class="hint">Aucun plugin n'est déclaré. Un plugin est un petit service (un conteneur de plus) qui apporte les activités d'une source comme Garmin Connect : ajoute-le à ton <code>docker-compose.yml</code>, puis déclare-le pour CyclAI avec deux variables d'environnement, par exemple :</p>
+<pre class="hint">CYCLAI_PLUGINS=garmin=http://garmin:8080
+CYCLAI_PLUGIN_GARMIN_SECRET=une-longue-phrase-secrete-partagee</pre>
+<p class="hint">Les identifiants de la source (clé API, etc.) se renseignent dans le conteneur du plugin, pas ici. Voir docs/PLUGINS.md.</p>"#
+    } else {
+        ""
+    };
 
     let body = format!(
         r##"{error_html}
@@ -258,44 +265,18 @@ document.querySelectorAll('.swatch').forEach(function(b) {{
 <div class="settings-group" id="sources">
 <div class="group-title" role="heading" aria-level="2">Sources d'activités</div>
 <section>
-<h2>Priorité et activation</h2>
-<p class="hint">CyclAI fonctionne seul : l'import de fichiers .fit/.gpx (bouton du tableau de bord) est toujours disponible et passe en premier. Strava et Garmin sont des plugins, désactivés tant que tu ne les actives pas. « Synchroniser » interroge les sources activées dans l'ordre ci-dessous ; une activité qui chevauche une activité déjà enregistrée est ignorée, donc la source la mieux classée l'emporte.</p>
+<h2>Plugins d'activités</h2>
+<p class="hint">CyclAI fonctionne seul : l'import de fichiers .fit/.gpx (bouton du tableau de bord) est toujours disponible et passe en premier. Les autres sources (par exemple Garmin Connect) sont des plugins, désactivés tant que tu ne les actives pas. « Synchroniser » interroge les plugins activés dans l'ordre ci-dessous ; une activité qui chevauche une activité déjà enregistrée est ignorée, donc la source la mieux classée l'emporte.</p>
 <form method="post" action="/settings/sources">
   <div class="source-row"><span><strong>1.</strong></span><span class="grow">Fichier .fit/.gpx <span class="badge">toujours actif</span></span></div>
 {source_rows}
+{no_plugins}
   <label>Chevauchement toléré entre deux activités (secondes)
   <input type="number" name="overlap_tolerance_s" value="{overlap_tolerance_s}" min="0" max="3600" step="1">
   </label>
   <p class="hint">Deux activités ne sont considérées comme superposées que si elles partagent plus de ce nombre de secondes (une sortie qui enchaîne directement sur la suivante ne compte pas).</p>
   <button type="submit">Enregistrer</button>
   <p class="hint">Le nouvel ordre ne joue que pour les prochaines synchronisations : les activités déjà enregistrées ne changent pas. Pour réappliquer un ordre à tout l'historique, il faut le réimporter.</p>
-</form>
-</section>
-<section>
-<h2>Strava</h2>
-<form method="post" action="/settings/keys">
-  <label>Client ID
-  <input type="text" name="strava_client_id" value="{strava_client_id}">
-  </label>
-  <label>Client Secret
-  <input type="password" autocomplete="off" name="strava_client_secret" value="{strava_client_secret}">
-  </label>
-  <label>Refresh Token
-  <input type="password" autocomplete="off" name="strava_refresh_token" value="{strava_refresh_token}">
-  </label>
-  <p class="hint">Renouvelé automatiquement par Strava à chaque synchronisation — à renseigner manuellement seulement pour une première configuration ou après révocation.</p>
-  <button type="submit">Enregistrer</button>
-</form>
-</section>
-
-<section>
-<h2>Garmin Connect</h2>
-<form method="post" action="/settings/keys">
-  <label>Clé API personnelle
-  <input type="password" autocomplete="off" name="garmin_api_key" value="{garmin_api_key}">
-  </label>
-  <p class="hint">À créer dans Garmin Connect, sous Paramètres → API personnelle (elle expire après 30, 90, 180 ou 365 jours). Seuls le vélo de route, le home-trainer et la course à pied sont importés ; chaque activité est récupérée avec son fichier .fit d'origine.</p>
-  <button type="submit">Enregistrer</button>
 </form>
 </section>
 </div>
@@ -372,11 +353,8 @@ document.querySelectorAll('.swatch').forEach(function(b) {{
         min_rest = rules.min_rest_days_per_week,
         run_pace = run_pace,
         source_rows = source_rows,
+        no_plugins = no_plugins,
         overlap_tolerance_s = source_cfg.tolerance_s,
-        garmin_api_key = escape_html(&source_cfg.garmin_api_key),
-        strava_client_id = escape_html(&settings.strava_client_id),
-        strava_client_secret = escape_html(&settings.strava_client_secret),
-        strava_refresh_token = escape_html(strava_refresh_token.as_deref().unwrap_or("")),
         anthropic_api_key = escape_html(&settings.anthropic_api_key),
         athlete_profile = escape_html(&settings.athlete_profile),
         bilan_system_prompt = escape_html(&settings.bilan_system_prompt),
@@ -392,42 +370,13 @@ pub async fn page(State(state): State<AppState>) -> Html<String> {
 
 #[derive(Deserialize)]
 pub struct KeysForm {
-    strava_client_id: Option<String>,
-    strava_client_secret: Option<String>,
-    strava_refresh_token: Option<String>,
     anthropic_api_key: Option<String>,
-    garmin_api_key: Option<String>,
 }
 
 pub async fn update_keys(State(state): State<AppState>, axum::extract::Form(form): axum::extract::Form<KeysForm>) -> Redirect {
-    // Strava and Anthropic have their own forms: only the fields a form sent are written.
-    for (column, value) in [
-        ("strava_client_id", &form.strava_client_id),
-        ("strava_client_secret", &form.strava_client_secret),
-        ("anthropic_api_key", &form.anthropic_api_key),
-        ("garmin_api_key", &form.garmin_api_key),
-    ] {
-        if let Some(v) = value {
-            let _ = sqlx::query(&format!("UPDATE settings SET {column} = ? WHERE id = 1")).bind(v.trim()).execute(&state.pool).await;
-        }
+    if let Some(key) = &form.anthropic_api_key {
+        let _ = sqlx::query("UPDATE settings SET anthropic_api_key = ? WHERE id = 1").bind(key.trim()).execute(&state.pool).await;
     }
-
-    // sync_state may not have a row yet on a fresh DB (only ever seeded/
-    // written by the boot seed or a completed sync) - upsert rather than
-    // assume it exists.
-    if let Some(token) = &form.strava_refresh_token {
-        let _ = sqlx::query(
-            r#"
-            INSERT INTO sync_state (id, last_sync_epoch, strava_refresh_token)
-            VALUES (1, 0, ?)
-            ON CONFLICT (id) DO UPDATE SET strava_refresh_token = excluded.strava_refresh_token
-            "#,
-        )
-        .bind(token.trim())
-        .execute(&state.pool)
-        .await;
-    }
-
     Redirect::to("/settings")
 }
 
@@ -624,7 +573,7 @@ pub async fn update_digest_prompt(State(state): State<AppState>, axum::extract::
 /// also saves the rest of the form, so nothing typed is lost.
 pub async fn update_sources(State(state): State<AppState>, axum::extract::Form(fields): axum::extract::Form<Vec<(String, String)>>) -> Redirect {
     let values = |name: &str| fields.iter().filter(|(k, _)| k == name).map(|(_, v)| v.clone()).collect::<Vec<_>>();
-    let mut order = crate::sources::normalize_order(&values("order"));
+    let mut order = crate::sources::normalize_order(&values("order"), &crate::sources::registry::ids());
     if let Some(m) = values("move").first()
         && let Some((id, dir)) = m.split_once(':')
         && let Some(i) = order.iter().position(|s| s == id)

@@ -306,7 +306,7 @@ fn free_ride_page(p: &crate::planned::Planned, id: i64, banner: &str) -> Html<St
             r#"<a class="back-link" href="/">&larr; Retour au calendrier</a>
 <section><h2>Sortie libre du {date}</h2>{banner}
 <p>Intention : <strong>{intent}</strong> · durée maximale : <strong>{duration} min</strong> · budget : <strong>{lo:.0} à {hi:.0} TSS</strong></p>
-<p class="hint">Pas de structure imposée : roule librement dans ce budget. La charge réelle remplace l'estimation quand la sortie est synchronisée depuis Strava.</p>
+<p class="hint">Pas de structure imposée : roule librement dans ce budget. La charge réelle remplace l'estimation quand la sortie est synchronisée depuis une source.</p>
 {notes}{activity}
 <form method="post" action="/planned/{id}/delete" onsubmit="return confirm('Retirer cette séance du calendrier ?');">
 <button type="submit" class="danger">Retirer du calendrier</button>

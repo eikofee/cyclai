@@ -448,6 +448,7 @@ dependencies = [
  "chrono",
  "chrono-tz",
  "clap",
+ "cyclai-plugin-sdk",
  "dotenvy",
  "fitparser",
  "gpx",
@@ -465,6 +466,21 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "zip",
+]
+
+[[package]]
+name = "cyclai-plugin-sdk"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "axum",
+ "hmac",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tokio",
 ]
 
 [[package]]

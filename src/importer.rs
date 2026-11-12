@@ -1,10 +1,9 @@
 //! Parses a manually-uploaded `.fit` or `.gpx` file into the same shape
-//! `sync::run` builds from a Strava activity, so everything downstream
+//! the plugins' sync produces, so everything downstream
 //! (metrics, zones, route thumbnail, detail-page charts) works unchanged
 //! regardless of where the ride came from — see `web::import`.
 //!
-//! FIT is the richer source (native power/HR/cadence/laps, like a Strava
-//! upload) and is preferred when available. GPX is a fallback: it only
+//! FIT is the richer source (native power/HR/cadence/laps) and is preferred when available. GPX is a fallback: it only
 //! carries GPS position/elevation/time, so power, heart rate, cadence and
 //! laps are always absent from a GPX import — no equivalent field exists in
 //! the format itself.
@@ -21,7 +20,7 @@ pub struct ParsedLap {
 }
 
 pub struct ParsedActivity {
-    pub started_at: String, // RFC3339, same convention as strava::models::SummaryActivity
+    pub started_at: String, // RFC3339, UTC
     pub duration_s: i64,
     pub distance_m: f64,
     pub elevation_gain_m: f64,
@@ -44,10 +43,10 @@ fn haversine_m(lat1: f64, lng1: f64, lat2: f64, lng2: f64) -> f64 {
 }
 
 /// Builds the streams JSON in the same `{"key": {"data": [...]}}` shape
-/// Strava's `get_streams` returns (see `strava::StravaClient::get_streams`)
+/// the activity sources produce
 /// — everything that reads `activity_streams.streams_json` downstream
 /// expects exactly this shape. Only keys with data are included, same as
-/// Strava omitting streams for sensors that weren't present.
+/// sources omitting streams for sensors that weren't present.
 fn build_streams_json(
     time: Vec<f64>,
     latlng: Vec<[f64; 2]>,
@@ -388,7 +387,7 @@ mod tests {
         assert!(streams.contains_key("altitude"));
         assert!(streams.contains_key("heartrate"));
         // No power/cadence sensor in this recording — the keys must be
-        // omitted entirely (matches Strava's own streams shape), not
+        // omitted entirely (matches the sources' streams shape), not
         // present with zero-filled data.
         assert!(!streams.contains_key("watts"));
         assert!(!streams.contains_key("cadence"));

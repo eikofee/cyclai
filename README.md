@@ -1,6 +1,6 @@
 # CyclAI
 
-Application **self-hosted, mono-utilisateur**, qui synchronise les activités Strava (vélo de route et course à pied), calcule des métriques d'entraînement déterministes (TSS/IF, zones, CTL/ATL/TSB) et génère bilans et séances avec l'API Anthropic (Claude) — ou sans, via un « rapport IA » à coller dans n'importe quel assistant.
+Application **self-hosted, mono-utilisateur**, qui importe tes activités (vélo de route et course à pied : fichiers FIT/GPX, ou sources branchables comme Garmin Connect), calcule des métriques d'entraînement déterministes (TSS/IF, zones, CTL/ATL/TSB) et génère bilans et séances avec l'API Anthropic (Claude) — ou sans, via un « rapport IA » à coller dans n'importe quel assistant.
 
 Écrite en Rust (axum + SQLite/sqlx), une seule image Docker, pas de JavaScript à builder. Prévue pour tourner sur un Raspberry Pi / NAS derrière un VPN : **il n'y a volontairement aucune authentification applicative**.
 
@@ -8,9 +8,9 @@ Application **self-hosted, mono-utilisateur**, qui synchronise les activités St
 
 | | |
 |---|---|
-| **Sources** | Sync Strava (OAuth, refresh token rotatif) + upload manuel de fichiers FIT / GPX |
+| **Sources** | Import de fichiers FIT / GPX (toujours disponible) + plugins d'activités (comme Garmin Connect) dans leur propre conteneur, avec priorité entre sources — voir [docs/PLUGINS.md](docs/PLUGINS.md) |
 | **Métriques** | TSS / IF avec un FTP *manuel*, zones de puissance (7) et de FC (5), CTL / ATL / TSB (Banister), hrTSS pour la course |
-| **Segments** | Matching GPS 100 % local (haversine) sur tes segments favoris Strava, avec deltas vs record / moyenne / dernier passage |
+| **Segments** | Segments importés depuis un fichier GPX ; matching GPS 100 % local (haversine), avec deltas vs record / moyenne / dernier passage |
 | **Bilan d'activité** | Texte qualitatif généré à la demande depuis la page d'une sortie, avec contexte libre optionnel |
 | **Digest hebdo** | Séance structurée (JSON) proposée à partir de la charge des 4 dernières semaines |
 | **Concepteur de séances** | Éditeur de séances par échelons (puissance, zones, FC, allure), profil graphique, TSS / durée / distance estimés |
@@ -31,7 +31,7 @@ cp .env.example .env   # ou créer .env à la main, voir « Configuration »
 cargo run -- serve     # dashboard sur http://localhost:3000
 ```
 
-Au premier lancement la base `cyclai.db` est créée et les migrations appliquées. Tout se règle ensuite depuis **Paramètres** (`/settings`) : clés Strava / Anthropic, FTP, FC, profil cycliste, prompts.
+Au premier lancement la base `cyclai.db` est créée et les migrations appliquées. Tout se règle ensuite depuis **Paramètres** (`/settings`) : sources d'activités, clé Anthropic, FTP, FC, profil cycliste, prompts.
 
 ### Configuration initiale (`.env`)
 
@@ -40,22 +40,24 @@ Ces variables ne servent qu'à **amorcer** la base au tout premier démarrage ; 
 | Variable | Défaut | Rôle |
 |---|---|---|
 | `DATABASE_URL` | `sqlite://cyclai.db` | Fichier SQLite |
-| `STRAVA_CLIENT_ID`, `STRAVA_CLIENT_SECRET` | — | App créée sur developers.strava.com |
-| `STRAVA_REFRESH_TOKEN` | — | Voir « Connecter Strava » |
+| `CYCLAI_PLUGINS`, `CYCLAI_PLUGIN_<ID>_SECRET` | — | Plugins d'activités à interroger, relus à chaque démarrage (pas seulement le premier) — voir « Brancher une source d'activités » |
 | `ANTHROPIC_API_KEY` | — | Optionnelle (sinon mode « rapport IA ») |
-| `FTP_WATTS` | `200` | FTP **manuel** (jamais l'auto-FTP Strava / Garmin) |
+| `FTP_WATTS` | `200` | FTP **manuel** (jamais l'auto-FTP d'une source) |
 | `HR_MAX`, `HR_REST` | `190`, `50` | Pour les zones Karvonen et le hrTSS |
 | `ATHLETE_PROFILE` | — | Profil libre réinjecté dans chaque prompt LLM |
 
 Aucune variable n'est obligatoire : sans rien, l'app démarre et se configure depuis le navigateur.
 
-### Connecter Strava
+### Brancher une source d'activités
 
-1. Crée une app sur <https://www.strava.com/settings/api> → `client_id` / `client_secret`.
-2. Autorise-la avec le scope **`read,activity:read_all`** (le scope `read` seul donne un 401 sur `/athlete/activities`) et échange le code contre un `refresh_token`.
-3. Saisis les trois valeurs dans `/settings`. Strava fait tourner le refresh token à chaque usage : CyclAI stocke le nouveau dans la table `sync_state`.
-4. Dashboard → **Synchroniser Strava**. Pour récupérer aussi l'historique ancien (ex. courses d'avant le support de la course à pied) : **Tout l'historique**.
-5. Étoile tes segments de référence sur Strava, puis `cyclai import-segments`.
+CyclAI fonctionne seul : le bouton **Importer GPX/FIT** du tableau de bord ne demande ni compte ni réseau. Pour récupérer automatiquement tes sorties depuis un service comme Garmin Connect, on ajoute un **plugin** : un petit service, dans son propre conteneur, qui détient les identifiants de la source. CyclAI l'appelle (requêtes signées) et ne lui donne aucun accès à sa base.
+
+1. Ajoute le conteneur du plugin à ton `docker-compose.yml` (chaque plugin a son dépôt, par exemple [cyclai-garmin](../cyclai-garmin)).
+2. Déclare-le pour CyclAI : `CYCLAI_PLUGINS=garmin=http://garmin:8080` et `CYCLAI_PLUGIN_GARMIN_SECRET=<secret partagé>`.
+3. Dans **Paramètres > Sources d'activités**, active le plugin et règle l'ordre de priorité.
+4. Dashboard → **Synchroniser**. **Tout l'historique** réimporte aussi les activités plus anciennes.
+
+Le protocole est décrit dans [docs/PLUGINS.md](docs/PLUGINS.md).
 
 ## Commandes
 
@@ -64,9 +66,8 @@ Aucune variable n'est obligatoire : sans rien, l'app démarre et se configure de
 | `cyclai serve` | Dashboard web seul (sans API) sur `0.0.0.0:3000` (`--bind` / `BIND_ADDR`) |
 | `cyclai serve-api` | API JSON seule sur `0.0.0.0:3001`, authentifiée par JWT RS256 — voir [API.md](API.md#authentification) |
 | `cyclai api-key add\|list\|revoke\|token` | Gère les clés publiques autorisées à appeler l'API |
-| `cyclai sync` | Récupère les nouvelles activités, recalcule les métriques, relance le matching de segments |
-| `cyclai sync --full` | Idem sur tout l'historique Strava (seules les activités absentes sont importées ; ~3 appels Strava chacune, reprend après une limite de débit) |
-| `cyclai import-segments` | Importe les coordonnées de tes segments **favoris** Strava dans `reference_segments` |
+| `cyclai sync` | Récupère les nouvelles activités de chaque plugin activé, recalcule les métriques, relance le matching de segments |
+| `cyclai sync --full` | Idem sur tout l'historique de chaque source (seules les activités absentes sont importées ; reprend après une limite de débit) |
 
 Le sync ne génère **pas** de bilan LLM : un bilan se déclenche depuis la page de l'activité (voir [docs/FONCTIONNALITES.md](docs/FONCTIONNALITES.md#bilan-dactivité)), pour pouvoir ajouter du contexte avant de payer l'analyse.
 
@@ -107,7 +108,7 @@ WantedBy=timers.target
 
 ### Sécurité
 
-Le dashboard (`serve`) n'a ni authentification ni TLS : n'expose jamais le port 3000 sur Internet, uniquement sur un réseau de confiance / VPN. Les clés (Strava, Anthropic) sont stockées **en clair** dans SQLite et affichées dans `/settings`.
+Le dashboard (`serve`) n'a ni authentification ni TLS : n'expose jamais le port 3000 sur Internet, uniquement sur un réseau de confiance / VPN. La clé Anthropic est stockée **en clair** dans SQLite et affichée dans `/settings` ; les identifiants des sources vivent dans les conteneurs des plugins, pas dans la base de CyclAI.
 
 Seule l'API (`serve-api`) est faite pour être exposée : elle ne sert rien d'autre que `/api/v1` et exige un JWT RS256 par requête. `docker-compose.yml` lance les deux processus sur la même base : l'UI dans le tailnet (`tailscale serve`), l'API éventuellement en funnel (`tailscale funnel`).
 
@@ -145,7 +146,7 @@ cargo run -- serve    # pas de rechargement à chaud : relancer après modificat
 
 ## Hors périmètre (volontaire)
 
-- Intégration Garmin (import Connect ou création de séances) : retirée ; les séances se saisissent à la main depuis le plan généré.
+- Connecteurs d'activités intégrés au cœur : ce sont des plugins externes (voir [docs/PLUGINS.md](docs/PLUGINS.md)). La création de séances dans un service tiers n'existe pas ; les séances se saisissent à la main depuis le plan généré.
 - Authentification du dashboard (accès VPN uniquement) ; seule l'API exposée est authentifiée.
-- `segment_efforts` calculés par Strava : tout le matching est local.
+- `segment_efforts` calculés par une plateforme : tout le matching est local.
 - Module salle de sport : retiré.

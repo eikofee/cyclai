@@ -92,7 +92,7 @@ mod tests {
             sqlx::query(&format!("DROP TABLE {t}")).execute(&pool).await.unwrap();
         }
         sqlx::query("DROP TABLE availability_exceptions").execute(&pool).await.unwrap();
-        for t in ["source_sync_state", "ignored_activities"] {
+        for t in ["source_sync_state", "ignored_activities", "plugin_info"] {
             sqlx::query(&format!("DROP TABLE {t}")).execute(&pool).await.unwrap();
         }
         sqlx::query("DROP INDEX idx_activities_source_external").execute(&pool).await.unwrap();
@@ -135,7 +135,7 @@ mod tests {
 
         migrate(&pool).await.unwrap();
         let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM _sqlx_migrations").fetch_one(&pool).await.unwrap();
-        assert_eq!(n, 12); // initial (adopted) + the eleven later migrations (applied after)
+        assert_eq!(n, 13); // initial (adopted) + the twelve later migrations (applied after)
         migrate(&pool).await.unwrap(); // idempotent
     }
 
@@ -167,40 +167,25 @@ pub async fn seed_athlete_config(pool: &SqlitePool, config: &Config) -> anyhow::
 /// defaults, on first run only — once the row exists, the /settings page
 /// owns it and env vars no longer take precedence.
 pub async fn seed_settings(pool: &SqlitePool, config: &Config) -> anyhow::Result<()> {
-    let inserted = sqlx::query(
+    sqlx::query(
         r#"
         INSERT OR IGNORE INTO settings
-            (id, strava_client_id, strava_client_secret, anthropic_api_key, athlete_profile,
-             bilan_system_prompt, digest_system_prompt)
-        VALUES (1, ?, ?, ?, ?, ?, ?)
+            (id, anthropic_api_key, athlete_profile, bilan_system_prompt, digest_system_prompt)
+        VALUES (1, ?, ?, ?, ?)
         "#,
     )
-    .bind(&config.strava_client_id)
-    .bind(&config.strava_client_secret)
     .bind(&config.anthropic_api_key)
     .bind(&config.athlete_profile)
     .bind(crate::llm::BILAN_DEFAULT_SYSTEM_PROMPT)
     .bind(crate::digest::DEFAULT_SYSTEM_PROMPT)
     .execute(pool)
-    .await?
-    .rows_affected()
-        > 0;
-    // Plugins are off by default; a Strava account configured through the
-    // environment on a fresh install keeps syncing.
-    if inserted && !config.strava_client_id.trim().is_empty() {
-        sqlx::query("UPDATE settings SET enabled_sources = '[\"strava\"]' WHERE id = 1")
-            .execute(pool)
-            .await?;
-    }
+    .await?;
     Ok(())
 }
 
-/// Seeds `sync_state`'s refresh token from env on first run — afterwards
-/// Strava rotates it on every use and /settings can edit it directly.
-pub async fn seed_sync_state(pool: &SqlitePool, config: &Config) -> anyhow::Result<()> {
-    sqlx::query("INSERT OR IGNORE INTO sync_state (id, last_sync_epoch, strava_refresh_token) VALUES (1, 0, ?)")
-        .bind(&config.strava_refresh_token)
-        .execute(pool)
-        .await?;
+/// Makes sure the `sync_state` row exists (legacy: it used to hold a source's
+/// rotating refresh token, now kept by the plugin itself).
+pub async fn seed_sync_state(pool: &SqlitePool, _config: &Config) -> anyhow::Result<()> {
+    sqlx::query("INSERT OR IGNORE INTO sync_state (id, last_sync_epoch) VALUES (1, 0)").execute(pool).await?;
     Ok(())
 }

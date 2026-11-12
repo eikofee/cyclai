@@ -7,7 +7,7 @@ const MONTHS_FR: [&str; 12] = [
     "Octobre", "Novembre", "Décembre",
 ];
 
-/// Strava's `start_date` is RFC3339 UTC. Converted to Europe/Paris (handles
+/// Activity start dates are RFC3339 UTC. Converted to Europe/Paris (handles
 /// CET/CEST DST automatically, unlike a hardcoded +2 offset) and formatted
 /// in French: "Dim. 16 Août 17:42".
 pub fn format_datetime_fr(rfc3339: &str) -> String {

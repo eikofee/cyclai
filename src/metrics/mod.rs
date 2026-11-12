@@ -8,7 +8,7 @@ pub fn is_supported_sport(sport_type: &str) -> bool {
     matches!(sport_type, "Ride" | "VirtualRide" | "Run" | "TrailRun")
 }
 
-/// Road rides and indoor/trainer rides (Strava `VirtualRide`: Zwift, smart
+/// Road rides and indoor/trainer rides (`VirtualRide`: Zwift, smart
 /// trainer) share the power-based pipeline.
 pub fn is_ride(sport_type: &str) -> bool {
     matches!(sport_type, "Ride" | "VirtualRide")
@@ -305,9 +305,8 @@ async fn update_run_hr_tss(pool: &SqlitePool, only: Option<&[i64]>) -> anyhow::R
     Ok(())
 }
 
-/// Standard TSS/IF formulas using normalized power (Strava's
-/// weighted_average_watts, captured only from real power-meter data —
-/// see strava::models::SummaryActivity).
+/// Standard TSS/IF formulas using normalized power (the sources' weighted
+/// average watts, captured only from real power-meter data).
 async fn update_tss_if(pool: &SqlitePool, ftp: f64) -> anyhow::Result<()> {
     sqlx::query(
         r#"

@@ -111,7 +111,7 @@ pub fn simulate(past: &[PastDay], future: &[FutureSession], rules: &Rules) -> Si
         return Simulation { days: vec![], violations: vec![] };
     };
     // Sessions dated on the last past day ("today") are added on top of what
-    // was already ridden that day (Strava is assumed synced). The day is then
+    // was already ridden that day (the activity sources are assumed synced). The day is then
     // recomputed from the day before and counts as projected.
     let same_day = past.len() >= 2 && future.iter().any(|s| s.date == last.date);
     let (base, start, carry) = if same_day {

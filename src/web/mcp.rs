@@ -233,7 +233,7 @@ fn tools() -> Vec<Tool> {
         },
         Tool {
             name: "propose_session",
-            description: "Propose a session for a day (today included; Strava is assumed synced). Give workout_id \
+            description: "Propose a session for a day (today included; the activity sources are assumed synced). Give workout_id \
                           (from search_workouts) OR free_ride_budget. Stored as `proposed`; the athlete validates it \
                           in the dashboard. Refused with `rule_violation` if it would newly break a hard rule. \
                           Retrying with the same idempotency_key returns the first proposal. Optionally offer `alternatives`.",
@@ -716,9 +716,6 @@ mod tests {
             &pool,
             &crate::config::Config {
                 database_url: "sqlite::memory:".into(),
-                strava_client_id: String::new(),
-                strava_client_secret: String::new(),
-                strava_refresh_token: String::new(),
                 anthropic_api_key: String::new(),
                 ftp_watts: 200,
                 hr_max: 190,

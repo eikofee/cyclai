@@ -189,7 +189,7 @@ Dernières sorties, de la plus récente à la plus ancienne.
 - `tss_load` : ce que la sortie ajoute à la charge totale — égal à `tss` pour le vélo, `tss` × `hr_tss_coefficient` pour une course. Le `tss` d'une course reste son hrTSS brut.
 - Les champs de puissance et `intensity_factor` sont `null` quand la donnée n'existe pas (toujours le cas pour une course).
 - Les sorties importées depuis un fichier FIT/GPX ont un `id` négatif.
-- Champs dérivés : `indoor` (`true` pour une sortie `VirtualRide`, trainer/Zwift), `power_source` (`none` sans puissance, `trainer` en intérieur, `pedals` en extérieur — Strava ne distingue pas plus finement), `has_hr` (une FC moyenne existe).
+- Champs dérivés : `indoor` (`true` pour une sortie `VirtualRide`, trainer/Zwift), `power_source` (`none` sans puissance, `trainer` en intérieur, `pedals` en extérieur — les sources ne distinguent pas plus finement), `has_hr` (une FC moyenne existe).
 
 ## GET /api/v1/activities/{id}
 
@@ -231,7 +231,7 @@ Une sortie, avec les mêmes champs que ci-dessus plus le détail calculé à par
 - `avg_power_w` / `max_power_w` / `normalized_power_w` (NP sur 30 s glissantes, `null` si le lap dure moins de 30 s) et `intensity_factor` (NP / FTP) ;
 - `avg_hr` / `max_hr`, cadence (`avg_cadence_rpm` pour le vélo, `avg_cadence_spm` en pas/min pour la course), D+, pente moyenne, vitesse ou allure ;
 - `power_zone_seconds` (7 zones, vélo) et `hr_zone_seconds` (5 zones Karvonen) : temps passé dans chaque zone.
-- Sans flux disponibles, un lap retombe sur les valeurs résumées de Strava (distance, puissance et FC moyennes) et les autres champs valent `null`.
+- Sans flux disponibles, un lap retombe sur les valeurs résumées de la source (distance, puissance et FC moyennes) et les autres champs valent `null`.
 
 **Performance** (`null` sans flux) — métriques sur toute la sortie :
 - `power_curve_w` : meilleure puissance moyenne sur 5 s à 60 min (`null` si la sortie est plus courte) ;
@@ -293,7 +293,7 @@ Synthèse de l'entraînement récent.
 }
 ```
 
-- `by_sport` est indexé par `sport_type` Strava (`Ride`, `Run`, `TrailRun`). Les `tss` (totaux, par sport, par semaine) additionnent le TSS puissance (vélo) et le hrTSS (course) **pondéré par le coefficient hrTSS**, comme la charge.
+- `by_sport` est indexé par `sport_type` (`Ride`, `Run`, `TrailRun`). Les `tss` (totaux, par sport, par semaine) additionnent le TSS puissance (vélo) et le hrTSS (course) **pondéré par le coefficient hrTSS**, comme la charge.
 - `by_week` : semaines débutant le lundi.
 
 ## GET /api/v1/workouts
@@ -395,7 +395,7 @@ Simulation, **rien n'est écrit** (accessible avec une clé `read`). Projette CT
 ], "include_planned": true}
 ```
 
-Chaque séance donne soit `workout_id` (TSS et IF calculés au FTP courant), soit `tss` (avec `intensity_factor` facultatif). Les dates vont d'aujourd'hui à 120 jours (une séance du jour s'ajoute à la charge déjà roulée, en supposant Strava synchronisé ; si une sortie est déjà enregistrée aujourd'hui, la séance planifiée du jour n'est pas recomptée). Réponse :
+Chaque séance donne soit `workout_id` (TSS et IF calculés au FTP courant), soit `tss` (avec `intensity_factor` facultatif). Les dates vont d'aujourd'hui à 120 jours (une séance du jour s'ajoute à la charge déjà roulée, en supposant les sources synchronisées ; si une sortie est déjà enregistrée aujourd'hui, la séance planifiée du jour n'est pas recomptée). Réponse :
 
 ```json
 {"from": "2026-11-10", "ok": false,
@@ -471,7 +471,7 @@ Clé `write`. Suggère une séance à partir d'un modèle ; l'utilisateur la **c
 - `422` si la séance introduirait une violation des [règles](#règles-dentraînement-et-projection-de-charge) qui n'existait pas déjà (le message liste les règles, avec leur date) : rien n'est enregistré. Une violation déjà présente dans le calendrier n'est pas imputée à la proposition.
 - `400` : date antérieure à aujourd'hui ou à plus de 120 jours, `rationale` vide ou de plus de 500 caractères, clé de plus de 100 caractères ; `404` : modèle inconnu.
 
-La date peut être aujourd'hui : la séance s'ajoute alors à la charge déjà roulée (Strava supposé synchronisé).
+La date peut être aujourd'hui : la séance s'ajoute alors à la charge déjà roulée (sources supposées synchronisées).
 
 #### Alternatives
 

@@ -191,6 +191,8 @@ struct AthleteConfig {
 
 struct ActivityRow {
     id: i64,
+    /// Link to the activity on its source's own site (given by the plugin).
+    source_link: Option<(String, String)>,
     is_run: bool,
     started_at: String,
     distance_m: f64,
@@ -234,11 +236,11 @@ async fn fetch_athlete_config(pool: &SqlitePool) -> anyhow::Result<AthleteConfig
 /// `activity_streams`, whose rows carry the full multi-hundred-KB streams.
 #[allow(clippy::type_complexity)]
 async fn fetch_recent_activities(pool: &SqlitePool) -> anyhow::Result<Vec<ActivityRow>> {
-    let rows: Vec<(i64, String, String, f64, i64, f64, Option<f64>, Option<f64>, Option<String>, Option<String>)> =
+    let rows: Vec<(i64, String, String, f64, i64, f64, Option<f64>, Option<f64>, Option<String>, Option<String>, String, Option<String>)> =
         sqlx::query_as(
             r#"
         SELECT a.id, a.sport_type, a.started_at, a.distance_m, a.duration_s, a.elevation_gain_m,
-               a.tss, a.intensity_factor, b.text, a.route_thumb_svg
+               a.tss, a.intensity_factor, b.text, a.route_thumb_svg, a.source, a.external_id
         FROM activities a
         LEFT JOIN activity_bilans b ON b.activity_id = a.id
         ORDER BY a.started_at DESC
@@ -248,13 +250,15 @@ async fn fetch_recent_activities(pool: &SqlitePool) -> anyhow::Result<Vec<Activi
         .fetch_all(pool)
         .await?;
 
+    let templates = crate::sources::link_templates(pool).await;
     Ok(rows
         .into_iter()
         .map(
-            |(id, sport_type, started_at, distance_m, duration_s, elevation_gain_m, tss, intensity_factor, bilan, route_thumb_svg)| {
+            |(id, sport_type, started_at, distance_m, duration_s, elevation_gain_m, tss, intensity_factor, bilan, route_thumb_svg, source, external_id)| {
                 let route_svg = route_thumb_svg.filter(|s| !s.is_empty());
                 ActivityRow {
                     id,
+                    source_link: crate::sources::activity_link(&templates, &source, external_id.as_deref()),
                     is_run: crate::metrics::is_run(&sport_type),
                     started_at,
                     distance_m,
@@ -987,22 +991,18 @@ fn render_activity_card(a: &ActivityRow) -> String {
         a.intensity_factor.map(|v| format!("<div>🎯 {} {v:.2}</div>", annotate_acronyms("IF"))).unwrap_or_default(),
     );
 
-    // Imported (GPX/FIT) activities use negative ids (see web::import) —
-    // there's no matching Strava activity to link to for those.
-    let strava_link = if a.id > 0 {
-        format!(
-            r#" · <a href="https://www.strava.com/activities/{}" target="_blank" rel="noopener">voir sur Strava ↗</a>"#,
-            a.id
-        )
-    } else {
-        String::new()
-    };
+    // Only what a plugin gave a link template for (a file import has none).
+    let source_link = a
+        .source_link
+        .as_ref()
+        .map(|(url, label)| format!(r#" · <a href="{}" target="_blank" rel="noopener noreferrer">{} ↗</a>"#, escape_html(url), escape_html(label)))
+        .unwrap_or_default();
 
     format!(
         r#"<li class="activity-card">
 {route}
 <div class="activity-body">
-<div class="activity-meta"><a href="/activity/{}">{}</a>{strava_link}</div>
+<div class="activity-meta"><a href="/activity/{}">{}</a>{source_link}</div>
 {}
 </div>
 {stats}
@@ -1301,7 +1301,7 @@ async fn digest_report(State(state): State<AppState>, Form(form): Form<DigestFor
     }
 }
 
-/// Starts a Strava sync in the background and returns right away; the
+/// Starts a sync of every enabled source in the background and returns right away; the
 /// dashboard polls `/sync/status` to show the current step. Mirrors the `sync`
 /// CLI command (same pipeline), triggered by a button instead of the timer.
 async fn trigger_sync(State(state): State<AppState>) -> Redirect {
@@ -1309,7 +1309,7 @@ async fn trigger_sync(State(state): State<AppState>) -> Redirect {
     Redirect::to("/")
 }
 
-/// Same as `trigger_sync` but walks the whole Strava history for activities
+/// Same as `trigger_sync` but walks the whole history of each source for activities
 /// not stored yet — how runs from before running support get imported.
 async fn trigger_full_sync(State(state): State<AppState>) -> Redirect {
     crate::sync::spawn(state.pool.clone(), true);

@@ -1,4 +1,4 @@
-//! Route-shape thumbnail SVG (like Strava's own small previews), computed
+//! Route-shape thumbnail SVG (like the small previews of activity platforms), computed
 //! once from an activity's raw GPS stream and cached in
 //! `activities.route_thumb_svg` (see `sync::run`) instead of being re-parsed
 //! from the full streams JSON on every dashboard load — a 2h ride at 1Hz is ~7000 GPS
@@ -65,7 +65,7 @@ fn render(latlng: &[[f64; 2]]) -> Option<String> {
     ))
 }
 
-/// Parses raw Strava stream JSON and renders the route thumbnail in one
+/// Parses raw stream JSON and renders the route thumbnail in one
 /// step — the only entry point callers need.
 pub fn compute(streams_json: &str) -> Option<String> {
     render(&extract_latlng(streams_json)?)

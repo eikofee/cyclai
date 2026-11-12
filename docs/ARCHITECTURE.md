@@ -5,7 +5,7 @@ Vue d'ensemble technique de CyclAI : flux de données, modules, schéma SQLite, 
 ## Flux
 
 ```
-Strava ──sync──┐                         ┌── bilan d'activité (à la demande) ──┐
+Plugins ──sync──┐                         ┌── bilan d'activité (à la demande) ──┐
 FIT / GPX ─────┴─> SQLite ─> metrics ─>  │                                     ├─> Anthropic (ou rapport IA .md)
                      │        segments   └── digest hebdo (bouton) ────────────┘
                      │                                   │
@@ -23,17 +23,17 @@ Le sync n'est **pas** un planificateur embarqué : c'est une sous-commande CLI (
 
 ```
 src/
-  main.rs            CLI (clap) : serve | serve-api | sync [--full] | import-segments | api-key | oauth ; amorçage de la base
+  main.rs            CLI (clap) : serve | serve-api | sync [--full] | api-key | oauth ; amorçage de la base
   config.rs          variables d'environnement d'amorçage (lues une fois)
   settings.rs        réglages en base : clés, profil, prompts (table settings)
   db/                connexion sqlx, migrations, seeds, rattrapage des miniatures
 
-  strava/            client API : OAuth (refresh rotatif), activités, streams, laps, segments favoris
-  sources/           plugins d'activités : trait ActivitySource (list / fetch), Strava, Garmin Connect (API personnelle, .fit d'origine), config (activation, ordre, tolérance), insertion commune et règle de chevauchement
+  sources/           sources d'activités : trait ActivitySource, registre des plugins (CYCLAI_PLUGINS), adaptateur HTTP vers un plugin (données validées), config (activation, ordre, tolérance), insertion commune et règle de chevauchement
+  plugin-sdk/        crate du protocole CyclAI <-> plugins : types, signature HMAC, client (cœur) et serveur (plugins)
   sync.rs            orchestration du sync (normal et --full) : boucle sur les plugins activés, par ordre de priorité
   zwift.rs           catalogue « Depuis Zwift » : plans et collections vélo > semaines/sous-groupes (data/zwift_plans.json, généré par tools/scrape_zwift.py), importé au démarrage
   garmin.rs          export d'une séance en .fit Garmin (rampes -> plages de puissance, % FTP ou watts)
-  importer.rs        parseurs FIT (fitparser) et GPX (gpx) -> même forme que le sync Strava
+  importer.rs        parseurs FIT (fitparser) et GPX (gpx) -> la forme commune à toutes les sources
 
   metrics/           TSS/IF, hrTSS, zones puissance, CTL/ATL/TSB, résumé dashboard
   segments/          import des segments favoris + matching haversine local
@@ -78,7 +78,7 @@ src/
 |---|---|
 | `metrics::run` | Point d'entrée des calculs : hrTSS des courses, TSS/IF des sorties, zones, `daily_load`, `dashboard_summary` |
 | `segments::run` | Reconstruit `segment_efforts` de zéro, activités triées par date |
-| `sync::run_inner` | Auth Strava → liste → filtre sports → insertion → `metrics::run` → `segments::run` |
+| `sync::run_inner` | Pour chaque plugin activé, par priorité : manifeste → liste → écarte connues / chevauchantes → téléchargement → insertion ; puis `metrics::run` → `segments::run` |
 | `llm::generate_activity_bilans` | Un appel LLM par activité demandée → `activity_bilans` |
 | `digest::generate` | Appel LLM → `digests` (+ `workouts` si le schéma est valide) |
 | `planned::prepare` | Valide une séance (dates, étapes, cibles, sport) avant insertion |
@@ -90,7 +90,7 @@ Les migrations de `migrations/` sont embarquées dans le binaire et appliquées 
 | Table | Contenu |
 |---|---|
 | `activities` | Une ligne par sortie : horodatage, `sport_type`, durée, distance, D+, puissance moy / NP, FC, `tss` + `tss_source` (`power` \| `hr`), `intensity_factor`, `zone1_s`…`zone7_s`, `title`, `description`, `user_context`, `route_thumb_svg`, `route_points_json` (trace simplifiée), `bests_computed`. Les imports FIT / GPX ont un **id négatif** |
-| `activity_streams` | `streams_json` brut (même forme que l'API Strava : `{clé: {data: [...]}}`) ; volumineux, jamais joint pour la liste |
+| `activity_streams` | `streams_json` brut (forme `{clé: {data: [...]}}` : `time`, `watts`, `heartrate`, `latlng`, `altitude`, `distance`, `cadence`) ; volumineux, jamais joint pour la liste |
 | `laps` | Laps (durée, distance, puissance et FC moyennes) |
 | `reference_segments` | Segments favoris : nom, coordonnées départ / arrivée, distance, D+ |
 | `segment_efforts` | Effort détecté : bornes temps / distance, puissance, vitesse, FC, deltas vs record / moyenne / dernier, activités de référence |
@@ -102,8 +102,8 @@ Les migrations de `migrations/` sont embarquées dans le binaire et appliquées 
 | `daily_load` | TSS, CTL, ATL, TSB par jour, de la première activité à aujourd'hui |
 | `dashboard_summary` | Cache d'une ligne pour la carte « 4 dernières semaines » |
 | `athlete_config` | FTP, FC max / repos / seuil, coefficient hrTSS, allure seuil de course |
-| `settings` | Clés Strava / Anthropic, profil cycliste, deux prompts système |
-| `sync_state` | Date du dernier sync, refresh token Strava (rotatif) |
+| `settings` | Clé Anthropic, profil cycliste, deux prompts système, sources (ordre, plugins activés, chevauchement toléré) |
+| `source_sync_state`, `ignored_activities`, `plugin_info` | Dernier sync par source ; activités écartées car chevauchantes ; nom et lien de chaque plugin (son manifeste) |
 | `coach_note`, `checkins` | Message du dashboard ; ressenti quotidien |
 | `training_rules` | Règles dures ajustables dans /settings |
 | `availability_defaults`, `availability_exceptions` | Temps disponible par jour de semaine / par date |
@@ -117,8 +117,8 @@ Les migrations de `migrations/` sont embarquées dans le binaire et appliquées 
 
 À respecter avant de « simplifier » :
 
-- **FTP manuel**, stocké en base (pas en dur, pas l'auto-FTP Strava / Garmin) — réglable après un retest, et tout l'historique est recalculé.
-- **Matching de segments local**, jamais les `segment_efforts` de Strava.
+- **FTP manuel**, stocké en base (pas en dur, pas l'auto-FTP d'une source) — réglable après un retest, et tout l'historique est recalculé.
+- **Matching de segments local**, jamais les `segment_efforts` d'une plateforme.
 - **Pas d'authentification applicative** : accès VPN uniquement.
 - **Zones de puissance à 7 niveaux** (Coggan étendu) ; zones de FC à 5 niveaux (Karvonen) — deux modèles distincts.
 - **Distance estimée calculée en Rust**, jamais par le LLM.
@@ -126,7 +126,7 @@ Les migrations de `migrations/` sont embarquées dans le binaire et appliquées 
 - **Sync par CLI externe**, pas de scheduler embarqué.
 - **Bilans à la demande**, pas au sync : permet d'ajouter du contexte et évite un backfill payant (le premier sync complet avait généré 221 appels d'un coup).
 - **Format de séance stable** (cf. [FONCTIONNALITES.md](FONCTIONNALITES.md#format-dune-séance)) : partagé par le digest, le concepteur, le calendrier et l'API.
-- **Pas d'intégration Garmin** : retirée.
+- **Aucun connecteur d'activités dans le cœur** : les sources sont des plugins externes, voir [PLUGINS.md](PLUGINS.md).
 - **Durées affichées en `H:MM:SS`**.
 - **Réutiliser des bibliothèques** plutôt que réinventer (Chart.js, Leaflet, FullCalendar) ; seule la miniature de tracé est un SVG maison, pour éviter un fond de carte sur 10 vignettes.
 

@@ -74,7 +74,7 @@ async fn insert_imported_activity(
     crate::sources::insert(
         pool,
         &crate::sources::NewActivity {
-            source: "file",
+            source: "file".to_string(),
             external_id: None,
             started_at: parsed.started_at,
             sport_type: "Ride".to_string(),

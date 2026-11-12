@@ -1,0 +1,30 @@
+[package]
+name = "cyclai-plugin-sdk"
+version = "0.1.0"
+edition = "2024"
+description = "Protocol shared by CyclAI and its activity-source plugins (Garmin, ...): types, request signing, HTTP client and server."
+
+[features]
+default = []
+# What CyclAI itself uses: call plugins.
+client = ["dep:reqwest"]
+# What a plugin uses: answer CyclAI.
+server = ["dep:axum", "dep:tokio"]
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+async-trait = "0.1"
+hmac = "0.12"
+sha2 = "0.10"
+anyhow = "1"
+reqwest = { version = "0.12", features = ["json"], optional = true }
+axum = { version = "0.8", optional = true }
+tokio = { version = "1", features = ["net", "rt-multi-thread", "macros", "time"], optional = true }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full"] }
+
+[[test]]
+name = "roundtrip"
+required-features = ["client", "server"]

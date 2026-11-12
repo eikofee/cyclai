@@ -90,7 +90,7 @@ pub async fn run(pool: &SqlitePool) -> anyhow::Result<()> {
 /// Like `run`, but ignores each source's last-sync marker and the list of
 /// ignored activities, walking the whole history for activities not stored yet
 /// (e.g. runs, which were filtered out before running was supported). Rate
-/// limits (Strava: 100 requests / 15 min, ~3 per imported activity) can cut a
+/// limits (a source's API quota) can cut a
 /// big backfill short: the next call resumes with what's still missing.
 pub async fn run_full(pool: &SqlitePool) -> anyhow::Result<()> {
     run_inner(pool, true).await.map(|_| ())
@@ -100,10 +100,10 @@ pub async fn run_full(pool: &SqlitePool) -> anyhow::Result<()> {
 async fn run_inner(pool: &SqlitePool, full: bool) -> anyhow::Result<Option<String>> {
     set_step("Chargement de la configuration", 0, 0);
     let cfg = crate::sources::config(pool).await;
-    let sources = crate::sources::active_and_configured(pool).await;
+    let sources: Vec<String> = cfg.active().into_iter().map(String::from).collect();
     if sources.is_empty() {
         anyhow::bail!(
-            "aucune source d'activités n'est activée et configurée : active Strava ou Garmin dans Paramètres > Sources d'activités (l'import de fichiers .fit/.gpx reste disponible sur le tableau de bord)"
+            "aucune source d'activités n'est activée : active un plugin dans Paramètres > Sources d'activités (l'import de fichiers .fit/.gpx reste disponible sur le tableau de bord)"
         );
     }
 
@@ -145,12 +145,8 @@ async fn sync_source(pool: &SqlitePool, id: &str, full: bool, tolerance_s: i64, 
     use crate::sources;
     let label = sources::label(id);
     set_step(format!("{label} : authentification"), 0, 0);
-    let Some(source) = sources::connect(id, pool).await? else {
-        anyhow::bail!("non configuré");
-    };
-
+    let source = sources::connect(id, pool).await?;
     let result = import_from(pool, source.as_ref(), full, tolerance_s, imported).await;
-    // The token Strava rotated must be kept even when the import stopped midway.
     source.finish(pool).await?;
     result
 }
@@ -221,7 +217,7 @@ mod tests {
 
     #[async_trait::async_trait]
     impl ActivitySource for Fake {
-        fn id(&self) -> &'static str {
+        fn id(&self) -> &str {
             "garmin"
         }
         async fn list(&self, _after: i64) -> anyhow::Result<Vec<Listed>> {
@@ -230,7 +226,7 @@ mod tests {
         async fn fetch(&self, l: &Listed) -> anyhow::Result<Option<NewActivity>> {
             self.downloads.fetch_add(1, Ordering::SeqCst);
             Ok(Some(NewActivity {
-                source: "garmin",
+                source: "garmin".to_string(),
                 external_id: Some(l.external_id.clone()),
                 started_at: l.started_at.clone(),
                 sport_type: "Ride".into(),
@@ -257,7 +253,6 @@ mod tests {
             start_epoch: crate::sources::epoch_of(start).unwrap(),
             duration_s,
             sport_type: "Ride".into(),
-            raw: serde_json::Value::Null,
         }
     }
 
@@ -304,5 +299,106 @@ mod tests {
         // A bigger tolerance lets the 4 s overlap through on a full sync.
         import_from(&pool, &fake, true, 7200, &mut again).await.unwrap();
         assert_eq!(again.len(), 2, "with a huge tolerance nothing overlaps");
+    }
+
+    /// A real plugin service on a local port, driven through the HTTP adapter.
+    struct Service;
+
+    #[async_trait::async_trait]
+    impl cyclai_plugin_sdk::Plugin for Service {
+        async fn manifest(&self) -> cyclai_plugin_sdk::Manifest {
+            cyclai_plugin_sdk::Manifest {
+                protocol: cyclai_plugin_sdk::PROTOCOL_VERSION,
+                id: "fake".into(),
+                label: "Fake source".into(),
+                version: "1".into(),
+                sports: vec!["Ride".into()],
+                configured: true,
+                message: None,
+                activity_url: Some("https://example.com/a/{id}".into()),
+                activity_url_label: Some("voir chez Fake".into()),
+            }
+        }
+        async fn list(&self, _after: i64) -> Result<Vec<cyclai_plugin_sdk::ListedActivity>, cyclai_plugin_sdk::PluginError> {
+            let item = |id: &str, start: &str, epoch: i64| cyclai_plugin_sdk::ListedActivity {
+                external_id: id.into(),
+                title: format!("ride {id}"),
+                started_at: start.into(),
+                start_epoch: epoch,
+                duration_s: Some(1800),
+                sport_type: "Ride".into(),
+            };
+            let base = crate::sources::epoch_of("2026-11-10T08:00:00Z").unwrap();
+            Ok(vec![item("dup", "2026-11-10T08:00:03Z", base + 3), item("new", "2026-11-11T08:00:00Z", base + 86_400)])
+        }
+        async fn fetch(&self, id: &str) -> Result<cyclai_plugin_sdk::Fetched, cyclai_plugin_sdk::PluginError> {
+            Ok(cyclai_plugin_sdk::Fetched::Activity(cyclai_plugin_sdk::Activity {
+                started_at: "2026-11-11T08:00:00Z".into(),
+                sport_type: "Ride".into(),
+                duration_s: 1800,
+                distance_m: 10_000.0,
+                elevation_gain_m: 50.0,
+                avg_power_w: Some(150.0),
+                normalized_power_w: Some(155.0),
+                avg_hr: None,
+                max_hr: None,
+                title: format!("ride {id}"),
+                description: None,
+                streams: serde_json::json!({"time": {"data": [0, 1, 2]}, "watts": {"data": [150, 150, 150]}}),
+                laps: vec![],
+            }))
+        }
+    }
+
+    #[tokio::test]
+    async fn a_sync_goes_through_a_real_plugin_over_signed_http() {
+        let _lock = crate::sources::registry::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let secret = "an-integration-test-secret";
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let router = cyclai_plugin_sdk::app(std::sync::Arc::new(Service), secret);
+        tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+
+        let pool = SqlitePoolOptions::new().connect("sqlite::memory:").await.unwrap();
+        crate::db::migrate(&pool).await.unwrap();
+        let config = crate::config::Config {
+            database_url: "sqlite::memory:".into(),
+            anthropic_api_key: String::new(),
+            ftp_watts: 200,
+            hr_max: 190,
+            hr_rest: 50,
+            athlete_profile: String::new(),
+        };
+        crate::db::seed_athlete_config(&pool, &config).await.unwrap();
+        crate::db::seed_settings(&pool, &config).await.unwrap();
+        crate::db::seed_sync_state(&pool, &config).await.unwrap();
+        sqlx::query("INSERT INTO activities (id, started_at, duration_s, distance_m, elevation_gain_m, source) VALUES (-1, '2026-11-10T08:00:00Z', 3600, 1, 0, 'file')")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        crate::sources::registry::set(vec![crate::sources::registry::PluginEndpoint { id: "fake".into(), url: format!("http://{addr}"), secret: secret.into() }]);
+        // Declared but off by default: nothing to sync.
+        assert!(run(&pool).await.unwrap_err().to_string().contains("aucune source"));
+        crate::sources::save_order_and_enabled(&pool, &["fake".to_string()], &["fake".to_string()]).await.unwrap();
+
+        run(&pool).await.unwrap();
+        let rows: Vec<(String, String, Option<String>)> =
+            sqlx::query_as("SELECT source, title, external_id FROM activities WHERE source = 'fake'").fetch_all(&pool).await.unwrap();
+        assert_eq!(rows, [("fake".to_string(), "ride new".to_string(), Some("new".to_string()))], "the duplicate of the file import was ignored");
+        assert!(crate::sources::is_ignored(&pool, "fake", "dup").await);
+        let links = crate::sources::link_templates(&pool).await;
+        assert_eq!(links["fake"].1, "voir chez Fake", "the manifest's link reached the database");
+
+        // Nothing new the second time.
+        run(&pool).await.unwrap();
+        let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM activities").fetch_one(&pool).await.unwrap();
+        assert_eq!(n, 2);
+
+        // A wrong secret is an error naming the source, not a panic or a silent skip.
+        crate::sources::registry::set(vec![crate::sources::registry::PluginEndpoint { id: "fake".into(), url: format!("http://{addr}"), secret: "another-secret-entirely".into() }]);
+        let err = run(&pool).await.unwrap_err().to_string();
+        assert!(err.contains("Fake source") && err.contains("401"), "{err}");
+        crate::sources::registry::set(vec![]);
     }
 }

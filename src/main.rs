@@ -19,7 +19,6 @@ mod route_profile;
 mod route_thumb;
 mod segments;
 mod settings;
-mod strava;
 mod sync;
 mod web;
 mod workout;
@@ -38,11 +37,11 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Fetch new Strava activities/streams, run deterministic calcs, generate per-activity bilans.
+    /// Fetch new activities from every enabled source plugin and run the deterministic calcs.
     /// Triggered daily by a systemd timer.
     Sync {
-        /// Walk the whole Strava history (not just activities since the last
-        /// sync) and import whatever isn't stored yet — e.g. past runs.
+        /// Walk the whole history of each source (not just activities since the
+        /// last sync) and import whatever isn't stored yet — e.g. past runs.
         #[arg(long)]
         full: bool,
     },
@@ -65,9 +64,6 @@ enum Command {
     /// Manage the OAuth access of MCP connectors (Claude web/mobile).
     #[command(subcommand)]
     Oauth(OauthCommand),
-    /// One-time (or re-run as needed) import of starred Strava segments'
-    /// coordinates into reference_segments. Starring itself is manual.
-    ImportSegments,
 }
 
 #[derive(Subcommand)]
@@ -114,7 +110,7 @@ async fn oauth_command(pool: &sqlx::SqlitePool, cmd: OauthCommand) -> anyhow::Re
     match cmd {
         OauthCommand::SetPassword => {
             let interactive = std::io::stdin().is_terminal();
-            let mut read = |prompt: &str| -> anyhow::Result<String> {
+            let read = |prompt: &str| -> anyhow::Result<String> {
                 if interactive {
                     eprint!("{prompt}");
                     std::io::stderr().flush()?;
@@ -207,6 +203,12 @@ async fn main() -> anyhow::Result<()> {
     db::seed_settings(&pool, &config).await?;
     db::seed_sync_state(&pool, &config).await?;
     zwift::seed(&pool).await?;
+    // Activity-source plugins are declared in the environment (docker-compose).
+    match sources::registry::from_env() {
+        Ok(endpoints) => sources::registry::set(endpoints),
+        Err(err) => tracing::error!(error = %err, "CYCLAI_PLUGINS ignored"),
+    }
+    sources::load_labels(&pool).await;
 
     match cli.command {
         Command::Sync { full } => {
@@ -217,6 +219,9 @@ async fn main() -> anyhow::Result<()> {
             }
         }
         Command::Serve { bind } => {
+            // Names and links of the plugins, without waiting for a first sync.
+            let background = pool.clone();
+            tokio::spawn(async move { sources::refresh_manifests(&background).await });
             web::serve(pool, &bind).await?;
         }
         Command::ServeApi { bind } => {
@@ -227,9 +232,6 @@ async fn main() -> anyhow::Result<()> {
         }
         Command::Oauth(cmd) => {
             oauth_command(&pool, cmd).await?;
-        }
-        Command::ImportSegments => {
-            segments::import_starred(&pool).await?;
         }
     }
 

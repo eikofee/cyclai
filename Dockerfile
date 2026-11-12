@@ -3,10 +3,12 @@ WORKDIR /app
 
 # Cache dependencies separately from source changes.
 COPY Cargo.toml Cargo.lock ./
-RUN mkdir src && echo "fn main() {}" > src/main.rs \
+COPY plugin-sdk/Cargo.toml plugin-sdk/Cargo.toml
+RUN mkdir -p src plugin-sdk/src plugin-sdk/tests && echo "fn main() {}" > src/main.rs && touch plugin-sdk/src/lib.rs plugin-sdk/tests/roundtrip.rs \
     && cargo build --release \
-    && rm -rf src
+    && rm -rf src plugin-sdk/src plugin-sdk/tests
 
+COPY plugin-sdk ./plugin-sdk
 COPY src ./src
 COPY assets ./assets
 COPY migrations ./migrations
@@ -14,7 +16,7 @@ COPY migrations ./migrations
 COPY data ./data
 # sqlx::migrate! embeds migration files at compile time, so touch main.rs to
 # force a rebuild past the dummy binary cached above.
-RUN touch src/main.rs && cargo build --release
+RUN touch src/main.rs plugin-sdk/src/lib.rs && cargo build --release
 
 FROM debian:bookworm-slim AS runtime
 RUN apt-get update \

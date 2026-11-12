@@ -63,9 +63,6 @@ mod tests {
     fn test_config() -> crate::config::Config {
         crate::config::Config {
             database_url: "sqlite::memory:".into(),
-            strava_client_id: String::new(),
-            strava_client_secret: String::new(),
-            strava_refresh_token: String::new(),
             anthropic_api_key: String::new(),
             ftp_watts: 200,
             hr_max: 190,
