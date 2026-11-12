@@ -116,7 +116,24 @@ fn extract_geometry(streams_json: &str, start_s: f64, end_s: f64) -> Option<Geom
 
     let n = latlng.len().min(distance.len()).min(time.len());
     let idx: Vec<usize> = (0..n).filter(|&i| time[i] >= start_s && time[i] <= end_s).collect();
-    let (&first, _) = (idx.first()?, idx.last()?);
+    build_geometry(&latlng, &distance, altitude.as_deref().filter(|a| a.len() >= n), &idx)
+}
+
+/// A segment's own track, stored when it was imported from a GPX file.
+fn track_geometry(track_json: &str) -> Option<Geometry> {
+    let v: serde_json::Value = serde_json::from_str(track_json).ok()?;
+    let latlng = crate::segments::latlng_array(&v)?;
+    let distance = crate::segments::f64_array(&v, "distance")?;
+    let altitude = crate::segments::f64_array(&v, "altitude");
+    let n = latlng.len().min(distance.len());
+    let idx: Vec<usize> = (0..n).collect();
+    build_geometry(&latlng, &distance, altitude.as_deref().filter(|a| a.len() >= n), &idx)
+}
+
+/// Thins the samples `idx` to a point every ~10 m, smooths the altitude and
+/// estimates the gradient over ~100 m.
+fn build_geometry(latlng: &[[f64; 2]], distance: &[f64], altitude: Option<&[f64]>, idx: &[usize]) -> Option<Geometry> {
+    let &first = idx.first()?;
 
     let mut kept: Vec<usize> = vec![first];
     for &i in &idx[1..] {
@@ -136,7 +153,7 @@ fn extract_geometry(streams_json: &str, start_s: f64, end_s: f64) -> Option<Geom
     let dist_m: Vec<f64> = kept.iter().map(|&i| distance[i] - d0).collect();
     let pts: Vec<[f64; 2]> = kept.iter().map(|&i| latlng[i]).collect();
 
-    let (ele, grade) = match altitude.filter(|a| a.len() >= n) {
+    let (ele, grade) = match altitude {
         Some(alt) => {
             let raw: Vec<f64> = kept.iter().map(|&i| alt[i]).collect();
             let smooth: Vec<f64> = (0..raw.len())
@@ -284,10 +301,22 @@ async fn render_detail(state: &AppState, seg: &SegmentRow) -> String {
         })
         .collect();
 
-    // Track + profile from the most recent effort whose streams have altitude
-    // (falling back to the most recent one with a usable track).
-    let mut geometry: Option<Geometry> = None;
+    // Track + profile: the segment's own track when it was imported from a GPX
+    // file (so they show before any effort), else the most recent effort whose
+    // streams have altitude (falling back to the most recent usable track).
+    let own_track: Option<String> = sqlx::query_scalar("SELECT track_json FROM reference_segments WHERE id = ?")
+        .bind(seg.id)
+        .fetch_optional(&state.pool)
+        .await
+        .ok()
+        .flatten()
+        .flatten();
+    let mut geometry: Option<Geometry> = own_track.as_deref().and_then(track_geometry);
+    let own_track_found = geometry.is_some();
     for e in efforts.iter().take(5) {
+        if own_track_found {
+            break;
+        }
         let (Some(s), Some(en)) = (e.start_s, e.end_s) else { continue };
         let streams: Option<String> = sqlx::query_scalar("SELECT streams_json FROM activity_streams WHERE activity_id = ?")
             .bind(e.activity_id)
@@ -371,7 +400,7 @@ async fn render_detail(state: &AppState, seg: &SegmentRow) -> String {
             .to_string()
             .replace("</", "<\\/");
             let profile = if g.ele_m.is_empty() {
-                r#"<p class="hint">Pas d'altitude dans les données de la sortie : pas de profil.</p>"#
+                r#"<p class="hint">Pas d'altitude dans les données : pas de profil.</p>"#
             } else {
                 r#"<h3>Profil et pente</h3><div class="grade-legend" id="seg-legend"></div><div class="seg-chart-wrap"><canvas id="seg-chart"></canvas></div>"#
             };
@@ -468,6 +497,25 @@ const SEGMENT_JS: &str = r##"
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn a_gpx_segment_shows_its_map_and_slope_before_any_effort() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new().connect("sqlite::memory:").await.unwrap();
+        crate::db::migrate(&pool).await.unwrap();
+        // 1 km northwards climbing 6 %.
+        let pts: String = (0..=10)
+            .map(|i| format!(r#"<trkpt lat="{}" lon="5.0"><ele>{}</ele></trkpt>"#, 45.0 + i as f64 * 0.0009, 200.0 + i as f64 * 6.0))
+            .collect();
+        let gpx = format!(r#"<?xml version="1.0"?><gpx version="1.1" creator="t" xmlns="http://www.topografix.com/GPX/1/1"><trk><trkseg>{pts}</trkseg></trk></gpx>"#);
+        let id = crate::segments::import_gpx(&pool, "Col sans passage", gpx.as_bytes()).await.unwrap();
+
+        let state = AppState { pool };
+        let html = render(&state, Some(id), None).await;
+        assert!(html.contains(r#"id="seg-map""#), "the map is there without any effort");
+        assert!(html.contains("Profil et pente"), "and the profile");
+        assert!(html.contains("Aucun passage détecté"), "the efforts table still says there is none");
+        assert!(html.contains(r#""grade":[6"#) || html.contains("\"grade\""), "the gradient is computed");
+    }
 
     #[test]
     fn geometry_slices_window_and_estimates_grade() {

@@ -11,6 +11,40 @@ const MATCH_THRESHOLD_M: f64 = 15.0;
 const MIN_SEGMENT_ENDS_M: f64 = 2.0 * MATCH_THRESHOLD_M;
 const MIN_SEGMENT_LENGTH_M: f64 = 100.0;
 
+/// The segment's track as stored: streams-shaped JSON (`latlng`, `distance`,
+/// `altitude`) with a point about every 5 m, so a long segment stays small.
+fn segment_track(streams: &serde_json::Value) -> Option<String> {
+    let latlng = latlng_array(streams)?;
+    let altitude = f64_array(streams, "altitude").filter(|a| a.len() == latlng.len());
+    let (mut pts, mut dist, mut alt): (Vec<[f64; 2]>, Vec<f64>, Vec<f64>) = (Vec::new(), Vec::new(), Vec::new());
+    let mut total = 0.0;
+    let mut since_kept = f64::MAX;
+    for (i, p) in latlng.iter().enumerate() {
+        if i > 0 {
+            let step = haversine_m(latlng[i - 1][0], latlng[i - 1][1], p[0], p[1]);
+            total += step;
+            since_kept += step;
+        }
+        let last = i + 1 == latlng.len();
+        if since_kept >= 5.0 || last {
+            pts.push(*p);
+            dist.push((total * 10.0).round() / 10.0);
+            if let Some(a) = &altitude {
+                alt.push((a[i] * 10.0).round() / 10.0);
+            }
+            since_kept = 0.0;
+        }
+    }
+    if pts.len() < 2 {
+        return None;
+    }
+    let mut out = serde_json::json!({ "latlng": { "data": pts }, "distance": { "data": dist } });
+    if altitude.is_some() {
+        out["altitude"] = serde_json::json!({ "data": alt });
+    }
+    Some(out.to_string())
+}
+
 /// Creates (or updates, by name) a reference segment from a GPX file: its
 /// start and end are the first and last points of the track. Returns its id.
 /// The detection then runs again over every stored ride.
@@ -38,12 +72,13 @@ pub async fn import_gpx(pool: &SqlitePool, name: &str, gpx: &[u8]) -> anyhow::Re
     );
     sqlx::query(
         r#"
-        INSERT INTO reference_segments (name, start_lat, start_lng, end_lat, end_lng, distance_m, elevation_gain_m)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO reference_segments (name, start_lat, start_lng, end_lat, end_lng, distance_m, elevation_gain_m, track_json)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT (name) DO UPDATE SET
             start_lat = excluded.start_lat, start_lng = excluded.start_lng,
             end_lat = excluded.end_lat, end_lng = excluded.end_lng,
-            distance_m = excluded.distance_m, elevation_gain_m = excluded.elevation_gain_m
+            distance_m = excluded.distance_m, elevation_gain_m = excluded.elevation_gain_m,
+            track_json = excluded.track_json
         "#,
     )
     .bind(name)
@@ -53,6 +88,7 @@ pub async fn import_gpx(pool: &SqlitePool, name: &str, gpx: &[u8]) -> anyhow::Re
     .bind(elng)
     .bind(parsed.distance_m)
     .bind(parsed.elevation_gain_m)
+    .bind(segment_track(&parsed.streams_json))
     .execute(pool)
     .await?;
     let id: i64 = sqlx::query_scalar("SELECT id FROM reference_segments WHERE name = ?").bind(name).fetch_one(pool).await?;
@@ -423,6 +459,13 @@ mod tests {
         assert_eq!(name, "Col du test");
         assert!((slat - 45.0).abs() < 1e-9 && (elat - 45.005).abs() < 1e-9);
         assert!((dist - 556.0).abs() < 10.0, "{dist}");
+        // The track is kept (about a point every 5 m, with altitude) for the map and profile.
+        let stored: String = sqlx::query_scalar("SELECT track_json FROM reference_segments WHERE id = ?").bind(id).fetch_one(&pool).await.unwrap();
+        let t: serde_json::Value = serde_json::from_str(&stored).unwrap();
+        let n = t["latlng"]["data"].as_array().unwrap().len();
+        assert!((6..=120).contains(&n), "{n}");
+        assert_eq!(t["altitude"]["data"].as_array().unwrap().len(), n);
+        assert!((t["distance"]["data"].as_array().unwrap().last().unwrap().as_f64().unwrap() - 556.0).abs() < 10.0);
 
         // Same name: updated, not duplicated.
         let again = import_gpx(&pool, "Col du test", &gpx(&track[..4])).await.unwrap();
