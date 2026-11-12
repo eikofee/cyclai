@@ -104,9 +104,7 @@ pub(super) struct AuthorizeParams {
     state: Option<String>,
 }
 
-fn esc(s: &str) -> String {
-    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;").replace('\'', "&#39;")
-}
+use super::escape_html as esc;
 
 fn page(status: StatusCode, body: &str) -> Response {
     let html = format!(

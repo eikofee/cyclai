@@ -550,11 +550,10 @@ pub async fn update(State(state): State<AppState>, Path(id): Path<i64>, Form(for
 }
 
 async fn save(state: &AppState, id: Option<i64>, form: WorkoutForm) -> Html<String> {
-    if let Some(id) = id {
-        if is_catalogue(&state.pool, id).await {
+    if let Some(id) = id
+        && is_catalogue(&state.pool, id).await {
             return Html(render_readonly(id, &state.pool, &fetch_athlete(&state.pool).await).await);
         }
-    }
     let ath = fetch_athlete(&state.pool).await;
     let sport = Sport::parse(&form.sport).unwrap_or_default();
 
@@ -602,13 +601,12 @@ async fn save(state: &AppState, id: Option<i64>, form: WorkoutForm) -> Html<Stri
 
     // The planned entry gets its own copy of the steps: later edits to this
     // template don't move sessions already on the calendar.
-    if let Some(date) = planned_date {
-        if let Err(err) =
+    if let Some(date) = planned_date
+        && let Err(err) =
             crate::planned::insert(&state.pool, date, &prepared, None, template_id, "manual", sport).await
         {
             tracing::error!(?err, "failed to schedule workout from the designer");
         }
-    }
 
     render_list_page(&state.pool, None, None).await
 }

@@ -73,6 +73,47 @@ async fn adopt_squashed_history(pool: &SqlitePool, migrator: &sqlx::migrate::Mig
     Ok(())
 }
 
+/// Seeds `athlete_config` from env defaults on first run only — once the row
+/// exists, env vars no longer take precedence (the dashboard owns it).
+pub async fn seed_athlete_config(pool: &SqlitePool, config: &Config) -> anyhow::Result<()> {
+    sqlx::query(
+        "INSERT OR IGNORE INTO athlete_config (id, ftp_watts, hr_max, hr_rest) VALUES (1, ?, ?, ?)",
+    )
+    .bind(config.ftp_watts)
+    .bind(config.hr_max)
+    .bind(config.hr_rest)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Seeds `settings` from env defaults and the LLM prompts' hardcoded
+/// defaults, on first run only — once the row exists, the /settings page
+/// owns it and env vars no longer take precedence.
+pub async fn seed_settings(pool: &SqlitePool, config: &Config) -> anyhow::Result<()> {
+    sqlx::query(
+        r#"
+        INSERT OR IGNORE INTO settings
+            (id, anthropic_api_key, athlete_profile, bilan_system_prompt, digest_system_prompt)
+        VALUES (1, ?, ?, ?, ?)
+        "#,
+    )
+    .bind(&config.anthropic_api_key)
+    .bind(&config.athlete_profile)
+    .bind(crate::llm::BILAN_DEFAULT_SYSTEM_PROMPT)
+    .bind(crate::digest::DEFAULT_SYSTEM_PROMPT)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Makes sure the `sync_state` row exists (legacy: it used to hold a source's
+/// rotating refresh token, now kept by the plugin itself).
+pub async fn seed_sync_state(pool: &SqlitePool, _config: &Config) -> anyhow::Result<()> {
+    sqlx::query("INSERT OR IGNORE INTO sync_state (id, last_sync_epoch) VALUES (1, 0)").execute(pool).await?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -148,45 +189,4 @@ mod tests {
         sqlx::query("UPDATE _sqlx_migrations SET version = 20260901000000").execute(&pool).await.unwrap();
         assert!(migrate(&pool).await.is_err());
     }
-}
-
-/// Seeds `athlete_config` from env defaults on first run only — once the row
-/// exists, env vars no longer take precedence (the dashboard owns it).
-pub async fn seed_athlete_config(pool: &SqlitePool, config: &Config) -> anyhow::Result<()> {
-    sqlx::query(
-        "INSERT OR IGNORE INTO athlete_config (id, ftp_watts, hr_max, hr_rest) VALUES (1, ?, ?, ?)",
-    )
-    .bind(config.ftp_watts)
-    .bind(config.hr_max)
-    .bind(config.hr_rest)
-    .execute(pool)
-    .await?;
-    Ok(())
-}
-
-/// Seeds `settings` from env defaults and the LLM prompts' hardcoded
-/// defaults, on first run only — once the row exists, the /settings page
-/// owns it and env vars no longer take precedence.
-pub async fn seed_settings(pool: &SqlitePool, config: &Config) -> anyhow::Result<()> {
-    sqlx::query(
-        r#"
-        INSERT OR IGNORE INTO settings
-            (id, anthropic_api_key, athlete_profile, bilan_system_prompt, digest_system_prompt)
-        VALUES (1, ?, ?, ?, ?)
-        "#,
-    )
-    .bind(&config.anthropic_api_key)
-    .bind(&config.athlete_profile)
-    .bind(crate::llm::BILAN_DEFAULT_SYSTEM_PROMPT)
-    .bind(crate::digest::DEFAULT_SYSTEM_PROMPT)
-    .execute(pool)
-    .await?;
-    Ok(())
-}
-
-/// Makes sure the `sync_state` row exists (legacy: it used to hold a source's
-/// rotating refresh token, now kept by the plugin itself).
-pub async fn seed_sync_state(pool: &SqlitePool, _config: &Config) -> anyhow::Result<()> {
-    sqlx::query("INSERT OR IGNORE INTO sync_state (id, last_sync_epoch) VALUES (1, 0)").execute(pool).await?;
-    Ok(())
 }

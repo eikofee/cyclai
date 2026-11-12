@@ -80,11 +80,10 @@ pub fn compute_points(streams_json: &str) -> Option<String> {
     }
     let stride = (latlng.len() / 150).max(1);
     let mut pts: Vec<[f64; 2]> = latlng.iter().step_by(stride).copied().collect();
-    if let (Some(last), Some(&end)) = (pts.last(), latlng.last()) {
-        if *last != end {
+    if let (Some(last), Some(&end)) = (pts.last(), latlng.last())
+        && *last != end {
             pts.push(end);
         }
-    }
     let r = |v: f64| (v * 1e5).round() / 1e5;
     let rounded: Vec<[f64; 2]> = pts.iter().map(|p| [r(p[0]), r(p[1])]).collect();
     serde_json::to_string(&rounded).ok()

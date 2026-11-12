@@ -394,7 +394,7 @@ mod tests {
     #[test]
     fn intensity_factor_from_tss() {
         assert!((intensity_factor(60.0, 100.0).unwrap() - 1.0).abs() < 1e-9);
-        assert!((intensity_factor(120.0, 100.0).unwrap() - 0.7071).abs() < 1e-3);
+        assert!((intensity_factor(120.0, 100.0).unwrap() - std::f64::consts::FRAC_1_SQRT_2).abs() < 1e-3);
         assert!(intensity_factor(0.0, 50.0).is_none());
     }
 }

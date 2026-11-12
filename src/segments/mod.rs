@@ -21,7 +21,7 @@ fn segment_track(streams: &serde_json::Value) -> Option<String> {
     let mut since_kept = f64::MAX;
     for (i, p) in latlng.iter().enumerate() {
         if i > 0 {
-            let step = haversine_m(latlng[i - 1][0], latlng[i - 1][1], p[0], p[1]);
+            let step = crate::geo::haversine_m(latlng[i - 1][0], latlng[i - 1][1], p[0], p[1]);
             total += step;
             since_kept += step;
         }
@@ -67,7 +67,7 @@ pub async fn import_gpx(pool: &SqlitePool, name: &str, gpx: &[u8]) -> anyhow::Re
         parsed.distance_m
     );
     anyhow::ensure!(
-        haversine_m(slat, slng, elat, elng) >= MIN_SEGMENT_ENDS_M,
+        crate::geo::haversine_m(slat, slng, elat, elng) >= MIN_SEGMENT_ENDS_M,
         "le départ et l'arrivée sont trop proches (boucle ?) : la détection a besoin de les distinguer, coupe la boucle en deux segments"
     );
     sqlx::query(
@@ -99,16 +99,6 @@ pub async fn import_gpx(pool: &SqlitePool, name: &str, gpx: &[u8]) -> anyhow::Re
     Ok(id)
 }
 
-fn haversine_m(lat1: f64, lng1: f64, lat2: f64, lng2: f64) -> f64 {
-    const EARTH_RADIUS_M: f64 = 6_371_000.0;
-    let dlat = (lat2 - lat1).to_radians();
-    let dlng = (lng2 - lng1).to_radians();
-    let a = (dlat / 2.0).sin().powi(2)
-        + lat1.to_radians().cos() * lat2.to_radians().cos() * (dlng / 2.0).sin().powi(2);
-    let c = 2.0 * a.sqrt().atan2((1.0 - a).sqrt());
-    EARTH_RADIUS_M * c
-}
-
 struct RefSegment {
     id: i64,
     start_lat: f64,
@@ -124,10 +114,10 @@ struct RefSegment {
 fn match_segment(latlng: &[[f64; 2]], seg: &RefSegment) -> Option<(usize, usize)> {
     let start_idx = latlng
         .iter()
-        .position(|p| haversine_m(p[0], p[1], seg.start_lat, seg.start_lng) < MATCH_THRESHOLD_M)?;
+        .position(|p| crate::geo::haversine_m(p[0], p[1], seg.start_lat, seg.start_lng) < MATCH_THRESHOLD_M)?;
     let end_idx = latlng[start_idx..]
         .iter()
-        .position(|p| haversine_m(p[0], p[1], seg.end_lat, seg.end_lng) < MATCH_THRESHOLD_M)
+        .position(|p| crate::geo::haversine_m(p[0], p[1], seg.end_lat, seg.end_lng) < MATCH_THRESHOLD_M)
         .map(|i| start_idx + i)?;
     if end_idx > start_idx {
         Some((start_idx, end_idx))
@@ -159,7 +149,7 @@ fn extract_portion(
     heartrate: Option<&[f64]>,
 ) -> Portion {
     let slice_avg = |data: Option<&[f64]>| {
-        data.and_then(|d| d.get(start_idx..=end_idx)).and_then(|s| mean(s))
+        data.and_then(|d| d.get(start_idx..=end_idx)).and_then(mean)
     };
     let dt = time.get(end_idx).zip(time.get(start_idx)).map(|(e, s)| e - s);
     let dd = distance
@@ -325,7 +315,7 @@ mod tests {
     #[test]
     fn haversine_known_distance() {
         // Roughly 1 degree of longitude at the equator ~= 111.2 km.
-        let d = haversine_m(0.0, 0.0, 0.0, 1.0);
+        let d = crate::geo::haversine_m(0.0, 0.0, 0.0, 1.0);
         assert!((d - 111_195.0).abs() < 200.0);
     }
 

@@ -43,7 +43,7 @@ pub struct Principal {
 
 impl Principal {
     fn allows(&self, scope: &str) -> bool {
-        self.scopes.iter().any(|s| *s == scope)
+        self.scopes.contains(&scope)
     }
 }
 
@@ -670,7 +670,7 @@ pub(super) async fn endpoint(State(state): State<AppState>, headers: HeaderMap, 
             for m in batch {
                 out.extend(handle_message(&state, &who, m).await);
             }
-            (!out.is_empty()).then(|| Value::Array(out))
+            (!out.is_empty()).then_some(Value::Array(out))
         }
         single => handle_message(&state, &who, single).await,
     };

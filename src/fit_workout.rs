@@ -137,7 +137,7 @@ fn string_field(out: &mut Vec<u8>, s: &str, size: usize) {
         end -= 1;
     }
     out.extend(&s.as_bytes()[..end]);
-    out.extend(std::iter::repeat(0).take(size - end));
+    out.extend(std::iter::repeat_n(0, size - end));
 }
 
 fn crc16(mut crc: u16, bytes: &[u8]) -> u16 {

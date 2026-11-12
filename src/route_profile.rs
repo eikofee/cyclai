@@ -37,15 +37,6 @@ const GRADE_WINDOW_M: f64 = 100.0;
 const MAX_ABS_GRADE_PCT: f64 = 30.0;
 const CLIMB_THRESHOLD_M: f64 = 2.0;
 
-fn haversine_m(a: [f64; 2], b: [f64; 2]) -> f64 {
-    const EARTH_RADIUS_M: f64 = 6_371_000.0;
-    let dlat = (b[0] - a[0]).to_radians();
-    let dlng = (b[1] - a[1]).to_radians();
-    let h = (dlat / 2.0).sin().powi(2)
-        + a[0].to_radians().cos() * b[0].to_radians().cos() * (dlng / 2.0).sin().powi(2);
-    EARTH_RADIUS_M * 2.0 * h.sqrt().atan2((1.0 - h).sqrt())
-}
-
 /// Reads a GPX file: tracks first (what most exports contain), falling back
 /// to `<rte>` routes (what planners such as Komoot/RideWithGPS can export).
 pub fn parse_gpx(bytes: &[u8]) -> anyhow::Result<RouteProfile> {
@@ -103,7 +94,7 @@ pub fn build_profile(points: &[([f64; 2], Option<f64>)]) -> anyhow::Result<Route
     let mut cum: Vec<f64> = vec![0.0];
     for i in 1..points.len() {
         let prev = *kept.last().unwrap();
-        let d = haversine_m(points[prev].0, points[i].0);
+        let d = crate::geo::haversine_m(points[prev].0[0], points[prev].0[1], points[i].0[0], points[i].0[1]);
         if d > 0.5 {
             kept.push(i);
             cum.push(cum.last().unwrap() + d);

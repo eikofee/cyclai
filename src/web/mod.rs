@@ -20,6 +20,7 @@ use axum::routing::{get, post};
 use axum::Router;
 use chrono::{Datelike, NaiveDate};
 use format::{format_datetime_fr, format_duration_hms};
+pub(crate) use format::escape_html;
 use regex::Regex;
 use serde::Deserialize;
 use sqlx::SqlitePool;
@@ -492,12 +493,6 @@ async fn fetch_latest_digest(pool: &SqlitePool) -> anyhow::Result<Option<DigestR
     }))
 }
 
-fn escape_html(s: &str) -> String {
-    s.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-}
-
 struct GlossaryTerm {
     acronym: &'static str,
     full_name: &'static str,
@@ -850,8 +845,8 @@ async fn load_chart_json(pool: &SqlitePool) -> String {
         .map(|(d, tss, ctl, atl, tsb)| serde_json::json!({"d": d, "tss": r1(*tss), "ctl": r1(*ctl), "atl": r1(*atl), "tsb": r1(*tsb)}))
         .collect();
     let today_idx = points.len().saturating_sub(1);
-    if let Some((last_date, _, mut ctl, mut atl, _)) = rows.last().cloned() {
-        if let Ok(mut day) = NaiveDate::parse_from_str(&last_date, "%Y-%m-%d") {
+    if let Some((last_date, _, mut ctl, mut atl, _)) = rows.last().cloned()
+        && let Ok(mut day) = NaiveDate::parse_from_str(&last_date, "%Y-%m-%d") {
             for _ in 0..LOAD_CHART_PROJECTION_DAYS {
                 day += chrono::Duration::days(1);
                 ctl += -ctl / 42.0;
@@ -859,7 +854,6 @@ async fn load_chart_json(pool: &SqlitePool) -> String {
                 points.push(serde_json::json!({"d": day.to_string(), "tss": 0, "ctl": r1(ctl), "atl": r1(atl), "tsb": r1(ctl - atl)}));
             }
         }
-    }
     serde_json::json!({
         "points": points,
         "todayIdx": today_idx,

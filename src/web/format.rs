@@ -47,6 +47,15 @@ pub fn format_pace_secs(secs_per_km: f64) -> String {
     format!("{}:{:02}", total / 60, total % 60)
 }
 
+/// Escapes text for HTML, in element content and in quoted attributes alike.
+pub fn escape_html(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&#39;")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

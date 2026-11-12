@@ -6,6 +6,7 @@ mod db;
 mod digest;
 mod envelope;
 mod fit_workout;
+mod geo;
 mod importer;
 mod llm;
 mod metrics;
