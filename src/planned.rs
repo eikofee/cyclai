@@ -102,12 +102,15 @@ impl Planned {
     }
 }
 
-pub const INTENTS: [&str; 3] = ["endurance", "denivele", "recuperation"];
+pub const INTENTS: [&str; 6] = ["endurance", "denivele", "recuperation", "tempo", "intense", "course"];
 
 pub fn intent_label(intent: &str) -> &'static str {
     match intent {
         "denivele" => "dénivelé",
         "recuperation" => "récupération",
+        "tempo" => "tempo",
+        "intense" => "intense",
+        "course" => "course",
         _ => "endurance",
     }
 }
@@ -118,6 +121,9 @@ fn intent_if_cap(intent: &str) -> f64 {
     match intent {
         "recuperation" => 0.60,
         "denivele" => 0.85,
+        "tempo" => 0.88,
+        "intense" => 0.95,
+        "course" => 1.0,
         _ => 0.75,
     }
 }
@@ -143,11 +149,18 @@ pub struct FreeRideBudget {
 /// Without `tss_range` the engine fills it in from the duration and the
 /// intent. The error is a user-facing message (the request is well-formed but
 /// the engine refuses it).
+///
+/// `expected_if` states how hard the ride will really be (a race, a fast group
+/// ride...): it replaces the intent's ceiling, and the budget is built around
+/// it so the rules see that intensity. It excludes `tss_range`.
+pub const EXPECTED_IF_RANGE: std::ops::RangeInclusive<f64> = 0.3..=1.2;
+
 pub fn free_ride_budget(
     tss_range: Option<(f64, f64)>,
     duration_max_min: i64,
     intent: &str,
     available_min: i64,
+    expected_if: Option<f64>,
 ) -> Result<FreeRideBudget, String> {
     if !INTENTS.contains(&intent) {
         return Err(format!("`intent` must be one of: {}", INTENTS.join(", ")));
@@ -159,6 +172,21 @@ pub fn free_ride_budget(
         return Err(format!(
             "`duration_max_min` ({duration_max_min}) exceeds the {available_min} min available that day (see /api/v1/availability)"
         ));
+    }
+    if let Some(e) = expected_if {
+        if !EXPECTED_IF_RANGE.contains(&e) {
+            return Err(format!("`expected_if` must be between {} and {}", EXPECTED_IF_RANGE.start(), EXPECTED_IF_RANGE.end()));
+        }
+        if tss_range.is_some() {
+            return Err("give `expected_if` or `tss_range`, not both".to_string());
+        }
+        let center = duration_max_min as f64 / 60.0 * 100.0 * e * e;
+        return Ok(FreeRideBudget {
+            tss_min: (center * 0.9).round(),
+            tss_max: (center * 1.1).round(),
+            duration_max_min,
+            intent: intent.to_string(),
+        });
     }
     let ceiling = tss_ceiling(intent, duration_max_min);
     let (tss_min, tss_max) = match tss_range {
@@ -524,14 +552,21 @@ mod tests {
     #[test]
     fn free_ride_budget_is_bounded_by_the_day_and_the_intent() {
         // 120 min of endurance (IF cap 0.75): ceiling 112 TSS. Default range = 60 %..100 %.
-        let b = free_ride_budget(None, 120, "endurance", 180).unwrap();
+        let b = free_ride_budget(None, 120, "endurance", 180, None).unwrap();
         assert_eq!((b.tss_min, b.tss_max), (68.0, 113.0));
-        assert!(free_ride_budget(Some((40.0, 100.0)), 120, "endurance", 180).is_ok());
-        assert!(free_ride_budget(Some((40.0, 200.0)), 120, "endurance", 180).unwrap_err().contains("out of reach"));
-        assert!(free_ride_budget(Some((90.0, 50.0)), 120, "endurance", 180).is_err(), "min > max");
-        assert!(free_ride_budget(None, 120, "endurance", 90).unwrap_err().contains("available"));
-        assert!(free_ride_budget(None, 10, "endurance", 90).is_err(), "too short");
-        assert!(free_ride_budget(None, 60, "sprint", 90).unwrap_err().contains("intent"));
+        assert!(free_ride_budget(Some((40.0, 100.0)), 120, "endurance", 180, None).is_ok());
+        assert!(free_ride_budget(Some((40.0, 200.0)), 120, "endurance", 180, None).unwrap_err().contains("out of reach"));
+        assert!(free_ride_budget(Some((90.0, 50.0)), 120, "endurance", 180, None).is_err(), "min > max");
+        assert!(free_ride_budget(None, 120, "endurance", 90, None).unwrap_err().contains("available"));
+        assert!(free_ride_budget(None, 10, "endurance", 90, None).is_err(), "too short");
+        assert!(free_ride_budget(None, 60, "sprint", 90, None).unwrap_err().contains("intent"));
+        // A race declares its own intensity: 90 min at IF 0.9 is ~121 TSS, centred in the budget.
+        let race = free_ride_budget(None, 90, "course", 120, Some(0.9)).unwrap();
+        assert_eq!((race.tss_min, race.tss_max), (109.0, 134.0));
+        assert!(crate::rules::intensity_factor(90.0, (race.tss_min + race.tss_max) / 2.0).unwrap() > 0.89);
+        assert!(free_ride_budget(Some((40.0, 80.0)), 90, "course", 120, Some(0.9)).unwrap_err().contains("not both"));
+        assert!(free_ride_budget(None, 90, "course", 120, Some(1.5)).unwrap_err().contains("expected_if"));
+        assert!(free_ride_budget(None, 90, "course", 120, None).is_ok(), "course now has its own ceiling");
         // Recovery is capped lower than hilly rides for the same duration.
         assert!(tss_ceiling("recuperation", 60) < tss_ceiling("denivele", 60));
     }
@@ -540,7 +575,7 @@ mod tests {
     async fn free_rides_count_at_mid_budget_and_complete_with_the_ride() {
         let pool = test_pool().await;
         let day = parse_date("2026-11-10").unwrap();
-        let budget = free_ride_budget(Some((40.0, 80.0)), 120, "endurance", 180).unwrap();
+        let budget = free_ride_budget(Some((40.0, 80.0)), 120, "endurance", 180, None).unwrap();
         let free = insert_free_ride(&pool, day, &budget, "api").await.unwrap();
         let p = get(&pool, free).await.unwrap().unwrap();
         assert!(p.is_free_ride());

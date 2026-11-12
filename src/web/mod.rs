@@ -168,7 +168,17 @@ fn api_router(state: AppState) -> Router {
         .route("/oauth/authorize", get(oauth::authorize_get).post(oauth::authorize_post))
         .route("/oauth/token", post(oauth::token))
         .merge(guarded)
+        .layer(axum::middleware::from_fn(log_request))
         .with_state(state)
+}
+
+/// One line per request on the public listener (method, path, status; never
+/// the query, headers or body), so a connector that cannot connect can be debugged.
+async fn log_request(req: axum::extract::Request, next: axum::middleware::Next) -> axum::response::Response {
+    let (method, path) = (req.method().clone(), req.uri().path().to_string());
+    let res = next.run(req).await;
+    tracing::info!(%method, path, status = res.status().as_u16(), "api request");
+    res
 }
 
 struct AthleteConfig {

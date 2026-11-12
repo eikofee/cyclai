@@ -298,6 +298,10 @@ mod tests {
         assert!(e["error"].as_str().unwrap().contains("out of reach"));
         let (s, ok) = post(serde_json::json!({"date": date(2), "rationale": "x", "free_ride_budget": {"duration_max_min": 120, "intent": "denivele", "tss_range": [40, 80]}})).await;
         assert_eq!(s, StatusCode::CREATED, "{ok}");
+        // A race states its real intensity: the engine plans it at that IF.
+        let (s, race) = post(serde_json::json!({"date": date(3), "rationale": "course", "free_ride_budget": {"duration_max_min": 90, "intent": "course", "expected_if": 0.9}})).await;
+        assert_eq!(s, StatusCode::CREATED, "{race}");
+        assert!((race["estimated_if"].as_f64().unwrap() - 0.9).abs() < 0.02, "{race}");
 
         // Bad shapes.
         let (s, _) = post(serde_json::json!({"date": date(1), "rationale": "x"})).await;

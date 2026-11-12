@@ -591,8 +591,11 @@ pub(super) struct FreeRideBudgetRequest {
     /// `[min, max]` TSS; filled in by the engine when omitted.
     tss_range: Option<[f64; 2]>,
     duration_max_min: i64,
-    /// `endurance` | `denivele` | `recuperation`
+    /// `endurance` | `denivele` | `recuperation` | `tempo` | `intense` | `course`
     intent: String,
+    /// Real intensity of the ride (0.3-1.2), for a race or a fast group ride.
+    /// Replaces the intent's ceiling; exclusive with `tss_range`.
+    expected_if: Option<f64>,
 }
 
 /// What a proposal adds to the calendar, validated but not yet stored.
@@ -650,6 +653,7 @@ pub(super) async fn proposal_create(
                 b.duration_max_min,
                 &b.intent,
                 available,
+                b.expected_if,
             )
             .map_err(|m| ApiError(StatusCode::UNPROCESSABLE_ENTITY, m))?;
             Candidate::FreeRide(budget)

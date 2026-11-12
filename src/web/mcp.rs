@@ -247,7 +247,8 @@ fn tools() -> Vec<Tool> {
                         json!({
                             "tss_range": json!({ "type": "array", "items": { "type": "number" }, "minItems": 2, "maxItems": 2, "description": "[min, max] TSS; the engine fills it when omitted." }),
                             "duration_max_min": int("Upper bound on the ride duration; must fit the day's availability."),
-                            "intent": json!({ "type": "string", "enum": ["endurance", "denivele", "recuperation"] }),
+                            "intent": json!({ "type": "string", "enum": ["endurance", "denivele", "recuperation", "tempo", "intense", "course"], "description": "Kind of ride; also sets the default intensity ceiling." }),
+                            "expected_if": json!({ "type": "number", "minimum": 0.3, "maximum": 1.2, "description": "Real intensity factor of the ride (e.g. ~0.9 for a race or a fast group ride). Overrides the intent's ceiling and is what the hard rules see (hard-day counting). Use it instead of tss_range." }),
                         }),
                         &["duration_max_min", "intent"],
                     ),
@@ -680,7 +681,18 @@ pub(super) async fn endpoint(State(state): State<AppState>, headers: HeaderMap, 
 }
 
 /// `GET`/`DELETE /mcp` — no server-initiated stream and no sessions.
-pub(super) async fn method_not_allowed() -> Response {
+/// Without a valid token the answer is the OAuth challenge (clients probe
+/// with GET first and need it to start the authorization flow).
+pub(super) async fn method_not_allowed(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    let token = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "));
+    match token {
+        None => return unauthorized(&headers, "missing bearer token"),
+        Some(t) if authenticate(&state, t).await.is_none() => return unauthorized(&headers, "invalid token"),
+        _ => {}
+    }
     (StatusCode::METHOD_NOT_ALLOWED, [(header::ALLOW, "POST")]).into_response()
 }
 
@@ -746,7 +758,9 @@ mod tests {
         assert!(challenge.contains("resource_metadata=") && challenge.contains("/.well-known/oauth-protected-resource"), "{challenge}");
         assert_eq!(rpc(&app, Some("garbage"), json!({})).await.0, StatusCode::UNAUTHORIZED);
         let get = Request::builder().method("GET").uri("/mcp").body(Body::empty()).unwrap();
-        assert_eq!(app.clone().oneshot(get).await.unwrap().status(), StatusCode::METHOD_NOT_ALLOWED);
+        let res = app.clone().oneshot(get).await.unwrap();
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+        assert!(res.headers().contains_key(header::WWW_AUTHENTICATE));
     }
 
     #[tokio::test]

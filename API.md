@@ -495,7 +495,7 @@ La date peut être aujourd'hui : la séance s'ajoute alors à la charge déjà r
  "free_ride_budget": {"duration_max_min": 150, "intent": "endurance", "tss_range": [70, 110]}}
 ```
 
-- `intent` : `endurance` | `denivele` | `recuperation`. `tss_range` est facultatif : sans lui, le moteur le calcule à partir de la durée et de l'intention (60 % à 100 % du plafond).
+- `intent` : `endurance` | `denivele` | `recuperation` | `tempo` | `intense` | `course` (plafonds IF 0,75 / 0,85 / 0,60 / 0,88 / 0,95 / 1,0). `expected_if` (0,3 à 1,2, facultatif) donne l'intensité réelle attendue (course, sortie de groupe rapide, test) : il remplace le plafond de l'intention, le budget est construit autour (TSS = durée × IF², ±10 %) et c'est cet IF que voient les règles dures (jours intenses consécutifs). Incompatible avec `tss_range`. `tss_range` est facultatif : sans lui, le moteur le calcule à partir de la durée et de l'intention (60 % à 100 % du plafond).
 - Le budget est borné par le moteur (`422` sinon) : `duration_max_min` (20 minimum) ne peut pas dépasser le temps disponible ce jour-là ([disponibilités](#disponibilités)), et le TSS maximal ne peut pas dépasser ce que l'intention permet sur cette durée (IF plafond 0,75 en endurance, 0,85 en dénivelé, 0,60 en récupération ; soit environ 56, 72 et 36 TSS par heure).
 - Règles dures : la proposition est vérifiée avec le haut du budget (pire cas). Une fois confirmée, la sortie compte dans la projection au milieu de la fourchette.
 - La séance renvoyée a `kind: "free_ride"` et un objet `free_ride_budget` (`tss_range`, `duration_max_min`, `intent`) ; les séances de bibliothèque ont `kind: "workout"`.
