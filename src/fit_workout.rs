@@ -1,7 +1,7 @@
-//! Export of a `Workout` to a Garmin `.fit` workout file (to drop in the
-//! device's `GARMIN/NewFiles` folder, or to import in Garmin Connect).
+//! Export of a `Workout` to a `.fit` workout file (to copy to a watch or
+//! bike computer's workouts folder, or to import in its companion app).
 //!
-//! Garmin has no ramp step: a ramp becomes a power *range* from its lowest to
+//! The FIT workout format has no ramp step: a ramp becomes a power *range* from its lowest to
 //! its highest point. Power targets stay in % of FTP when possible (the device
 //! then follows the FTP set on the watch / head unit), or are converted to
 //! watts with the app's FTP (`Mode::Watts`).
@@ -12,7 +12,7 @@ use crate::zwo::fracs;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
-    /// Custom power ranges in % of the FTP configured on the Garmin device.
+    /// Custom power ranges in % of the FTP configured on the device.
     PercentFtp,
     /// Custom power ranges in watts, from the FTP set in the app.
     Watts,

@@ -366,8 +366,8 @@ mod tests {
     /// the whole point is to validate the FIT field names/types against an
     /// actual device output, not against our own assumptions about them.
     #[test]
-    fn parses_real_garmin_fenix_5_bike_fixture() {
-        let bytes = std::fs::read("tests/fixtures/garmin-fenix-5-bike.fit").unwrap();
+    fn parses_real_device_bike_fixture() {
+        let bytes = std::fs::read("tests/fixtures/device-bike.fit").unwrap();
         let p = parse_fit(&bytes).unwrap();
 
         assert_eq!(p.started_at, "2017-06-12T16:09:22+00:00");

@@ -5,7 +5,7 @@ mod config;
 mod db;
 mod digest;
 mod envelope;
-mod garmin;
+mod fit_workout;
 mod importer;
 mod llm;
 mod metrics;

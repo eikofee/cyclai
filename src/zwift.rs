@@ -94,13 +94,13 @@ mod tests {
     }
 
     #[test]
-    fn every_session_exports_to_a_readable_garmin_file() {
+    fn every_session_exports_to_a_readable_fit_file() {
         let a = Athlete { ftp_watts: 205.0, hr_rest: 53.0, hr_max: 192.0, run_threshold_pace_s: 0.0 };
         let entries: Vec<Entry> = serde_json::from_str(PLANS).unwrap();
         for e in entries {
             let w: crate::workout::Workout = serde_json::from_value(e.workout).unwrap();
-            for mode in [crate::garmin::Mode::PercentFtp, crate::garmin::Mode::Watts] {
-                let bytes = crate::garmin::to_fit(&w, &a, Sport::Cycling, mode);
+            for mode in [crate::fit_workout::Mode::PercentFtp, crate::fit_workout::Mode::Watts] {
+                let bytes = crate::fit_workout::to_fit(&w, &a, Sport::Cycling, mode);
                 fitparser::from_bytes(&bytes).unwrap_or_else(|err| panic!("{}: {err}", w.name));
             }
         }

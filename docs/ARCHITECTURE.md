@@ -32,7 +32,7 @@ src/
   plugin-sdk/        crate du protocole CyclAI <-> plugins : types, signature HMAC, client (cœur) et serveur (plugins)
   sync.rs            orchestration du sync (normal et --full) : boucle sur les plugins activés, par ordre de priorité
   zwift.rs           catalogue « Depuis Zwift » : plans et collections vélo > semaines/sous-groupes (data/zwift_plans.json, généré par tools/scrape_zwift.py), importé au démarrage
-  garmin.rs          export d'une séance en .fit Garmin (rampes -> plages de puissance, % FTP ou watts)
+  fit_workout.rs     export d'une séance en .fit (rampes -> plages de puissance, % FTP ou watts)
   importer.rs        parseurs FIT (fitparser) et GPX (gpx) -> la forme commune à toutes les sources
 
   metrics/           TSS/IF, hrTSS, zones puissance, CTL/ATL/TSB, résumé dashboard

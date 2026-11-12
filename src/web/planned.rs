@@ -64,8 +64,8 @@ fn render_form(v: &FormView, ath: &Athlete) -> Html<String> {
         .delete_id
         .map(|id| {
             format!(
-                r#"<p><a class="secondary-action" href="/planned/{id}/fit" download>Exporter pour Garmin (.fit, % FTP)</a>
-<a class="secondary-action" href="/planned/{id}/fit?mode=watts" download>Garmin (.fit, watts)</a></p>"#
+                r#"<p><a class="secondary-action" href="/planned/{id}/fit" download>Exporter en .fit (% FTP)</a>
+<a class="secondary-action" href="/planned/{id}/fit?mode=watts" download>.fit (watts)</a></p>"#
             )
         })
         .unwrap_or_default();
@@ -428,7 +428,7 @@ pub async fn delete(State(state): State<AppState>, Path(id): Path<i64>) -> Redir
     Redirect::to("/")
 }
 
-/// `GET /planned/{id}/fit` — the planned session as a Garmin FIT workout.
+/// `GET /planned/{id}/fit` — the planned session as a FIT workout.
 pub async fn export_fit(State(state): State<AppState>, Path(id): Path<i64>, Query(q): Query<FitQuery>) -> Response {
     let Ok(Some(p)) = crate::planned::get(&state.pool, id).await else {
         return axum::http::StatusCode::NOT_FOUND.into_response();

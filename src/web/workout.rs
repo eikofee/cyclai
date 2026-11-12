@@ -121,7 +121,7 @@ pub async fn edit_form(State(state): State<AppState>, Path(id): Path<i64>) -> Ht
     ))
 }
 
-/// Download links of a session: Zwift (cycling only) and Garmin FIT.
+/// Download links of a session: Zwift (cycling only) and FIT.
 fn export_links_html(base: &str, sport: Sport) -> String {
     let zwo = if sport == Sport::Cycling {
         format!(r#"<a class="secondary-action" href="{base}/zwo" download>Exporter pour Zwift (.zwo)</a> "#)
@@ -129,8 +129,8 @@ fn export_links_html(base: &str, sport: Sport) -> String {
         String::new()
     };
     format!(
-        r#"<p>{zwo}<a class="secondary-action" href="{base}/fit" download>Exporter pour Garmin (.fit, % FTP)</a>
-<a class="secondary-action" href="{base}/fit?mode=watts" download>Garmin (.fit, watts)</a></p>"#
+        r#"<p>{zwo}<a class="secondary-action" href="{base}/fit" download>Exporter en .fit (% FTP)</a>
+<a class="secondary-action" href="{base}/fit?mode=watts" download>.fit (watts)</a></p>"#
     )
 }
 
@@ -189,18 +189,18 @@ pub struct FitQuery {
 
 pub(super) fn fit_response(workout: &Workout, sport: Sport, ath: &Athlete, q: &FitQuery) -> Response {
     let mode = if q.mode.as_deref() == Some("watts") {
-        crate::garmin::Mode::Watts
+        crate::fit_workout::Mode::Watts
     } else {
-        crate::garmin::Mode::PercentFtp
+        crate::fit_workout::Mode::PercentFtp
     };
     download(
         "application/octet-stream",
         format!("{}.fit", file_stem(&workout.name)),
-        crate::garmin::to_fit(workout, ath, sport, mode),
+        crate::fit_workout::to_fit(workout, ath, sport, mode),
     )
 }
 
-/// `GET /workouts/{id}/fit` — the saved session as a Garmin FIT workout.
+/// `GET /workouts/{id}/fit` — the saved session as a FIT workout.
 pub async fn export_fit(State(state): State<AppState>, Path(id): Path<i64>, Query(q): Query<FitQuery>) -> Response {
     let (workout, sport) = match load_workout(&state.pool, id).await {
         Ok(ok) => ok,
@@ -520,7 +520,7 @@ async fn render_readonly(id: i64, pool: &SqlitePool, ath: &Athlete) -> String {
 <section>
 <h2>Exporter</h2>
 {exports}
-<p class="hint">Garmin n'a pas de rampe : chaque rampe devient une plage de puissance cible (du point bas au point haut). En « % FTP », la montre applique sa propre FTP ; en « watts », la FTP de l'application.</p>
+<p class="hint">Le format .fit n'a pas de rampe : chaque rampe devient une plage de puissance cible (du point bas au point haut). En « % FTP », la montre applique sa propre FTP ; en « watts », la FTP de l'application.</p>
 </section>"#,
             name = escape_html(&name),
             ftp = ath.ftp_watts.round(),
