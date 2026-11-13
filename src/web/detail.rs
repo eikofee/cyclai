@@ -58,9 +58,10 @@ struct ActivityDetail {
 struct SegmentEffortRow {
     reference_segment_id: i64,
     name: String,
-    avg_power_w: f64,
-    delta_vs_pr_pct: Option<f64>,
-    delta_vs_last_pct: Option<f64>,
+    avg_power_w: Option<f64>,
+    /// (seconds, watts) against the record and the previous effort.
+    vs_pr: (Option<f64>, Option<f64>),
+    vs_last: (Option<f64>, Option<f64>),
     start_distance_m: Option<f64>,
     end_distance_m: Option<f64>,
     pr_activity_id: Option<i64>,
@@ -127,9 +128,10 @@ async fn fetch_activity(pool: &SqlitePool, id: i64) -> anyhow::Result<Option<Act
 
 #[allow(clippy::type_complexity)]
 async fn fetch_segment_efforts(pool: &SqlitePool, activity_id: i64) -> anyhow::Result<Vec<SegmentEffortRow>> {
-    let rows: Vec<(i64, String, f64, Option<f64>, Option<f64>, Option<f64>, Option<f64>, Option<i64>, Option<i64>)> = sqlx::query_as(
+    type Row = (i64, String, Option<f64>, Option<f64>, Option<f64>, Option<f64>, Option<f64>, Option<f64>, Option<f64>, Option<i64>, Option<i64>);
+    let rows: Vec<Row> = sqlx::query_as(
         r#"
-        SELECT rs.id, rs.name, se.avg_power_w, se.delta_vs_pr_pct, se.delta_vs_last_pct,
+        SELECT rs.id, rs.name, se.avg_power_w, se.delta_vs_pr_s, se.delta_vs_pr_w, se.delta_vs_last_s, se.delta_vs_last_w,
                se.start_distance_m, se.end_distance_m, se.pr_activity_id, se.last_activity_id
         FROM segment_efforts se
         JOIN reference_segments rs ON rs.id = se.reference_segment_id
@@ -141,12 +143,12 @@ async fn fetch_segment_efforts(pool: &SqlitePool, activity_id: i64) -> anyhow::R
     .await?;
     Ok(rows
         .into_iter()
-        .map(|(reference_segment_id, name, avg_power_w, delta_vs_pr_pct, delta_vs_last_pct, start_distance_m, end_distance_m, pr_activity_id, last_activity_id)| SegmentEffortRow {
+        .map(|(reference_segment_id, name, avg_power_w, pr_s, pr_w, last_s, last_w, start_distance_m, end_distance_m, pr_activity_id, last_activity_id)| SegmentEffortRow {
             reference_segment_id,
             name,
             avg_power_w,
-            delta_vs_pr_pct,
-            delta_vs_last_pct,
+            vs_pr: (pr_s, pr_w),
+            vs_last: (last_s, last_w),
             start_distance_m,
             end_distance_m,
             pr_activity_id,
@@ -1037,23 +1039,23 @@ pub async fn activity_detail(
                 let has_pr = !data["pr"].is_null();
                 let has_last = !data["last"].is_null();
                 let mut deltas = Vec::new();
-                if let Some(v) = s.delta_vs_pr_pct {
-                    deltas.push(format!("{v:+.1}% vs RP"));
+                if let Some(d) = crate::segments::format_delta(s.vs_pr.0, s.vs_pr.1) {
+                    deltas.push(format!("{d} vs RP"));
                 }
-                if let Some(v) = s.delta_vs_last_pct {
-                    deltas.push(format!("{v:+.1}% vs dernier"));
+                if let Some(d) = crate::segments::format_delta(s.vs_last.0, s.vs_last.1) {
+                    deltas.push(format!("{d} vs dernier"));
                 }
                 format!(
                     "<tr class=\"lap-row segment-row\" \
                      onclick=\"window.zoomToRange({start_km},{end_km});this.parentElement.querySelectorAll('.lap-row').forEach(r=>r.classList.remove('lap-row-active'));this.classList.add('lap-row-active')\" \
                      onmouseenter=\"window.previewLap && window.previewLap({start_km},{end_km});window.highlightLapOnMap && window.highlightLapOnMap({start_km},{end_km})\" \
                      onmouseleave=\"window.clearLapPreview && window.clearLapPreview();window.clearLapMapHighlight && window.clearLapMapHighlight()\">\
-                     <td>{}</td><td>{:.0}W{}</td>\
+                     <td>{}</td><td>{}{}</td>\
                      <td><input type=\"checkbox\" class=\"segment-overlay-cb\" onclick=\"event.stopPropagation()\" onchange=\"window.toggleSegmentOverlay(this,'pr',{idx})\" {}></td>\
                      <td><input type=\"checkbox\" class=\"segment-overlay-cb\" onclick=\"event.stopPropagation()\" onchange=\"window.toggleSegmentOverlay(this,'last',{idx})\" {}></td>\
                      </tr>",
                     escape_html(&s.name),
-                    s.avg_power_w,
+                    s.avg_power_w.map(|w| format!("{w:.0}W")).unwrap_or_else(|| "–".to_string()),
                     if deltas.is_empty() { String::new() } else { format!("<br><span class=\"hint\">{}</span>", deltas.join(", ")) },
                     if has_pr { "" } else { "disabled" },
                     if has_last { "" } else { "disabled" },

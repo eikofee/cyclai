@@ -57,7 +57,7 @@ Matching **100 % local**, indépendant des `segment_efforts` calculés par une p
 
 1. Importe un segment depuis un fichier **GPX** de son tracé (page Segments, avec un nom) : le premier point est le départ, le dernier l'arrivée. Seules ces **coordonnées**, la distance et le dénivelé sont conservés dans `reference_segments` ; une boucle (départ ≈ arrivée) doit être coupée en deux segments, et réimporter le même nom met le segment à jour. Un segment se supprime depuis sa page (avec ses passages détectés ; les sorties ne sont pas touchées).
 2. À chaque sync, pour chaque activité, le flux GPS est comparé aux deux extrémités par distance haversine (seuil de **15 m**) ; la portion entre l'entrée et la sortie fournit puissance, vitesse et FC moyennes.
-3. L'historique est traité **chronologiquement** et reconstruit à chaque sync : les deltas (vs record perso, vs moyenne des derniers passages, vs dernier passage) ne comparent un effort qu'à ce qui s'est passé *avant*.
+3. L'historique est traité **chronologiquement** et reconstruit à chaque sync : les écarts (vs record perso, vs moyenne des derniers passages, vs dernier passage) ne comparent un effort qu'à ce qui s'est passé *avant*. Le record est le passage **le plus rapide** ; un écart s'écrit en temps (`-5s`, `+1:05`, négatif = plus rapide) suivi, quand les deux passages ont de la puissance, de l'écart en watts (`-5s (+13W)`). Un passage sans capteur de puissance est détecté quand même, sa puissance reste vide.
 
 Les efforts apparaissent sur la page de l'activité et alimentent le bilan.
 

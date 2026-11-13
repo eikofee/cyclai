@@ -10,7 +10,7 @@ Application **self-hosted, mono-utilisateur**, qui importe tes activités (vélo
 |---|---|
 | **Sources** | Import de fichiers FIT / GPX (toujours disponible) + plugins d'activités (comme Garmin Connect) dans leur propre conteneur, avec priorité entre sources — voir [docs/PLUGINS.md](docs/PLUGINS.md) |
 | **Métriques** | TSS / IF avec un FTP *manuel*, zones de puissance (7) et de FC (5), CTL / ATL / TSB (Banister), hrTSS pour la course |
-| **Segments** | Segments importés depuis un fichier GPX ; matching GPS 100 % local (haversine), avec deltas vs record / moyenne / dernier passage |
+| **Segments** | Segments importés depuis un fichier GPX ; matching GPS 100 % local (haversine), avec écarts en temps (et en watts s'il y a de la puissance) vs record / moyenne / dernier passage |
 | **Bilan d'activité** | Texte qualitatif généré à la demande depuis la page d'une sortie, avec contexte libre optionnel |
 | **Digest hebdo** | Séance structurée (JSON) proposée à partir de la charge des 4 dernières semaines |
 | **Concepteur de séances** | Éditeur de séances par échelons (puissance, zones, FC, allure), profil graphique, TSS / durée / distance estimés |

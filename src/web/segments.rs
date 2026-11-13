@@ -81,7 +81,8 @@ struct EffortRow {
     avg_power_w: Option<f64>,
     avg_speed_ms: Option<f64>,
     avg_hr: Option<f64>,
-    delta_vs_pr_pct: Option<f64>,
+    /// Seconds and watts against the record at the time of the effort.
+    vs_pr: (Option<f64>, Option<f64>),
 }
 
 impl EffortRow {
@@ -285,9 +286,10 @@ async fn render(state: &AppState, selected: Option<i64>, error: Option<&str>) ->
 }
 
 async fn render_detail(state: &AppState, seg: &SegmentRow) -> String {
-    let rows: Vec<(i64, String, Option<String>, Option<f64>, Option<f64>, Option<f64>, Option<f64>, Option<f64>, Option<f64>)> =
+    type Row = (i64, String, Option<String>, Option<f64>, Option<f64>, Option<f64>, Option<f64>, Option<f64>, Option<f64>, Option<f64>);
+    let rows: Vec<Row> =
         sqlx::query_as(
-            "SELECT a.id, a.started_at, a.title, e.start_time_s, e.end_time_s, e.avg_power_w, e.avg_speed_ms, e.avg_hr, e.delta_vs_pr_pct \
+            "SELECT a.id, a.started_at, a.title, e.start_time_s, e.end_time_s, e.avg_power_w, e.avg_speed_ms, e.avg_hr, e.delta_vs_pr_s, e.delta_vs_pr_w \
              FROM segment_efforts e JOIN activities a ON a.id = e.activity_id \
              WHERE e.reference_segment_id = ? ORDER BY a.started_at DESC LIMIT ?",
         )
@@ -298,7 +300,7 @@ async fn render_detail(state: &AppState, seg: &SegmentRow) -> String {
         .unwrap_or_default();
     let efforts: Vec<EffortRow> = rows
         .into_iter()
-        .map(|(activity_id, started_at, title, start_s, end_s, avg_power_w, avg_speed_ms, avg_hr, delta_vs_pr_pct)| EffortRow {
+        .map(|(activity_id, started_at, title, start_s, end_s, avg_power_w, avg_speed_ms, avg_hr, pr_s, pr_w)| EffortRow {
             activity_id,
             started_at,
             title,
@@ -307,7 +309,7 @@ async fn render_detail(state: &AppState, seg: &SegmentRow) -> String {
             avg_power_w,
             avg_speed_ms,
             avg_hr,
-            delta_vs_pr_pct,
+            vs_pr: (pr_s, pr_w),
         })
         .collect();
 
@@ -359,7 +361,7 @@ async fn render_detail(state: &AppState, seg: &SegmentRow) -> String {
     }
 
     let efforts_html = if efforts.is_empty() {
-        r#"<p class="hint">Aucun passage détecté pour ce segment (il faut une sortie vélo avec puissance et GPS passant à moins de 15 m du départ puis de l'arrivée).</p>"#
+        r#"<p class="hint">Aucun passage détecté pour ce segment (il faut une sortie vélo avec GPS passant à moins de 15 m du départ puis de l'arrivée).</p>"#
             .to_string()
     } else {
         let best = best_time.unwrap_or(f64::MAX);
@@ -374,10 +376,7 @@ async fn render_detail(state: &AppState, seg: &SegmentRow) -> String {
                         if (d - best).abs() < 0.5 { format!("{t} 🏆") } else { t }
                     })
                     .unwrap_or_else(|| "–".into());
-                let delta = e
-                    .delta_vs_pr_pct
-                    .map(|d| format!("{d:+.1} %"))
-                    .unwrap_or_else(|| "–".into());
+                let delta = crate::segments::format_delta(e.vs_pr.0, e.vs_pr.1).unwrap_or_else(|| "–".into());
                 format!(
                     r#"<tr><td>{date}</td><td>{time}</td><td>{power}</td><td>{speed}</td><td>{hr}</td><td>{delta}</td><td><a href="/activity/{id}">{name}</a></td></tr>"#,
                     date = format_datetime_fr(&e.started_at),
@@ -389,8 +388,8 @@ async fn render_detail(state: &AppState, seg: &SegmentRow) -> String {
             })
             .collect();
         format!(
-            r#"<div class="table-wrap"><table class="records-table"><thead><tr><th>Date</th><th>Temps</th><th>Puissance</th><th>Vitesse</th><th>FC</th><th>Puiss. vs record</th><th>Sortie</th></tr></thead><tbody>{body}</tbody></table></div>
-<p class="hint">{n} derniers passages. « Puiss. vs record » compare la puissance moyenne à la meilleure obtenue avant ce passage.</p>"#,
+            r#"<div class="table-wrap"><table class="records-table"><thead><tr><th>Date</th><th>Temps</th><th>Puissance</th><th>Vitesse</th><th>FC</th><th>vs record</th><th>Sortie</th></tr></thead><tbody>{body}</tbody></table></div>
+<p class="hint">{n} derniers passages. « vs record » donne l'écart de temps (négatif = plus rapide) et, quand les deux passages ont de la puissance, de puissance moyenne, par rapport au passage le plus rapide avant celui-ci.</p>"#,
             n = efforts.len().min(EFFORTS_SHOWN as usize),
         )
     };

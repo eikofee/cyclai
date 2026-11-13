@@ -222,7 +222,12 @@ async fn main() -> anyhow::Result<()> {
         Command::Serve { bind } => {
             // Names and links of the plugins, without waiting for a first sync.
             let background = pool.clone();
-            tokio::spawn(async move { sources::refresh_manifests(&background).await });
+            tokio::spawn(async move {
+                sources::refresh_manifests(&background).await;
+                if let Err(err) = segments::refresh_if_stale(&background).await {
+                    tracing::error!(?err, "segment efforts: rebuild failed");
+                }
+            });
             web::serve(pool, &bind).await?;
         }
         Command::ServeApi { bind } => {

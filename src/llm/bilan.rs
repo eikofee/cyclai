@@ -41,10 +41,11 @@ struct ActivityDeltas {
 
 struct SegmentEffortRow {
     name: String,
-    avg_power_w: f64,
-    delta_vs_pr_pct: Option<f64>,
-    delta_vs_recent_avg_pct: Option<f64>,
-    delta_vs_last_pct: Option<f64>,
+    avg_power_w: Option<f64>,
+    /// (seconds, watts) against the record, the recent average and the previous effort.
+    vs_pr: (Option<f64>, Option<f64>),
+    vs_recent: (Option<f64>, Option<f64>),
+    vs_last: (Option<f64>, Option<f64>),
 }
 
 struct LapRow {
@@ -95,9 +96,11 @@ async fn fetch_activity_deltas(pool: &SqlitePool, activity_id: i64) -> anyhow::R
     .fetch_one(pool)
     .await?;
 
-    let segment_efforts: Vec<(String, f64, Option<f64>, Option<f64>, Option<f64>)> = sqlx::query_as(
+    type EffortRow = (String, Option<f64>, Option<f64>, Option<f64>, Option<f64>, Option<f64>, Option<f64>, Option<f64>);
+    let segment_efforts: Vec<EffortRow> = sqlx::query_as(
         r#"
-        SELECT rs.name, se.avg_power_w, se.delta_vs_pr_pct, se.delta_vs_recent_avg_pct, se.delta_vs_last_pct
+        SELECT rs.name, se.avg_power_w, se.delta_vs_pr_s, se.delta_vs_pr_w, se.delta_vs_recent_s, se.delta_vs_recent_w,
+               se.delta_vs_last_s, se.delta_vs_last_w
         FROM segment_efforts se
         JOIN reference_segments rs ON rs.id = se.reference_segment_id
         WHERE se.activity_id = ?
@@ -129,14 +132,12 @@ async fn fetch_activity_deltas(pool: &SqlitePool, activity_id: i64) -> anyhow::R
         zone_secs: [row.zone1_s, row.zone2_s, row.zone3_s, row.zone4_s, row.zone5_s, row.zone6_s, row.zone7_s],
         segment_efforts: segment_efforts
             .into_iter()
-            .map(|(name, avg_power_w, delta_vs_pr_pct, delta_vs_recent_avg_pct, delta_vs_last_pct)| {
-                SegmentEffortRow {
-                    name,
-                    avg_power_w,
-                    delta_vs_pr_pct,
-                    delta_vs_recent_avg_pct,
-                    delta_vs_last_pct,
-                }
+            .map(|(name, avg_power_w, pr_s, pr_w, recent_s, recent_w, last_s, last_w)| SegmentEffortRow {
+                name,
+                avg_power_w,
+                vs_pr: (pr_s, pr_w),
+                vs_recent: (recent_s, recent_w),
+                vs_last: (last_s, last_w),
             })
             .collect(),
         laps: laps
@@ -204,16 +205,16 @@ fn format_deltas(d: &ActivityDeltas) -> String {
     if !d.segment_efforts.is_empty() {
         out += "Segments de référence:\n";
         for seg in &d.segment_efforts {
-            out += &format!("- {}: {:.0}W", seg.name, seg.avg_power_w);
+            out += &format!("- {}", seg.name);
+            if let Some(w) = seg.avg_power_w {
+                out += &format!(": {w:.0}W");
+            }
+            // Time difference in seconds (negative = faster), then power in watts.
             let mut deltas = Vec::new();
-            if let Some(v) = seg.delta_vs_pr_pct {
-                deltas.push(format!("{v:+.1}% vs record perso"));
-            }
-            if let Some(v) = seg.delta_vs_recent_avg_pct {
-                deltas.push(format!("{v:+.1}% vs moyenne récente"));
-            }
-            if let Some(v) = seg.delta_vs_last_pct {
-                deltas.push(format!("{v:+.1}% vs dernier passage"));
+            for (label, (t, w)) in [("record perso", seg.vs_pr), ("moyenne récente", seg.vs_recent), ("dernier passage", seg.vs_last)] {
+                if let Some(d) = crate::segments::format_delta(t, w) {
+                    deltas.push(format!("{d} vs {label}"));
+                }
             }
             if !deltas.is_empty() {
                 out += &format!(" ({})", deltas.join(", "));
@@ -365,8 +366,8 @@ mod tests {
         .await
         .unwrap();
         sqlx::query(
-            "INSERT INTO segment_efforts (activity_id, reference_segment_id, avg_power_w, delta_vs_pr_pct, delta_vs_recent_avg_pct, delta_vs_last_pct) \
-             VALUES (1, 1, 220, 9.5, 9.5, 9.5)",
+            "INSERT INTO segment_efforts (activity_id, reference_segment_id, avg_power_w, delta_vs_pr_s, delta_vs_pr_w, delta_vs_recent_s, delta_vs_recent_w, delta_vs_last_s, delta_vs_last_w) \
+             VALUES (1, 1, 220, -5, 13, -4, 10, -3, 8)",
         )
         .execute(&pool)
         .await
@@ -392,7 +393,7 @@ mod tests {
         assert!(system.contains("coach cyclisme"));
         assert!(user_message.contains("profil de test"));
         assert!(user_message.contains("cote-test"));
-        assert!(user_message.contains("+9.5% vs record perso"));
+        assert!(user_message.contains("-5s (+13W) vs record perso"));
         assert!(user_message.contains("205W")); // FTP pulled live from athlete_config
     }
 

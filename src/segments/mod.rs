@@ -199,10 +199,37 @@ pub(crate) fn latlng_array(v: &serde_json::Value) -> Option<Vec<[f64; 2]>> {
         .collect()
 }
 
+/// An effort of a segment's history, as far as comparing the next one goes.
+struct PastEffort {
+    activity_id: i64,
+    duration_s: f64,
+    power_w: Option<f64>,
+}
+
+/// How an effort compares with a reference one: time difference in seconds
+/// (negative = faster) and, when both have power, difference in watts.
+fn delta(duration_s: f64, power_w: Option<f64>, reference: Option<(f64, Option<f64>)>) -> (Option<f64>, Option<f64>) {
+    let Some((ref_s, ref_w)) = reference else { return (None, None) };
+    (Some(duration_s - ref_s), power_w.zip(ref_w).map(|(p, r)| p - r))
+}
+
+/// "-5s (+13W)", or "-5s" when there is no power to compare; a minute or more
+/// reads "-1:05". `None` without a time difference.
+pub fn format_delta(time_s: Option<f64>, power_w: Option<f64>) -> Option<String> {
+    let t = time_s?.round() as i64;
+    let sign = if t < 0 { "-" } else if t > 0 { "+" } else { "" };
+    let a = t.abs();
+    let time = if a >= 60 { format!("{sign}{}:{:02}", a / 60, a % 60) } else { format!("{sign}{a}s") };
+    Some(match power_w {
+        Some(w) => format!("{time} ({:+.0}W)", w),
+        None => time,
+    })
+}
+
 /// Rebuilds `segment_efforts` from scratch, processing activities in
-/// chronological order so each effort's PR/recent-avg/last-effort deltas
-/// are computed against the history that existed *before* it — a replay,
-/// not a batch aggregate, since those deltas depend on ordering.
+/// chronological order so each effort is compared with the history that
+/// existed *before* it (a replay, not a batch aggregate). The record is the
+/// fastest earlier effort; power is optional throughout.
 pub async fn run(pool: &SqlitePool) -> anyhow::Result<()> {
     sqlx::query("DELETE FROM segment_efforts").execute(pool).await?;
 
@@ -260,40 +287,48 @@ pub async fn run(pool: &SqlitePool) -> anyhow::Result<()> {
                 watts.as_deref(),
                 heartrate.as_deref(),
             );
-            let Some(power) = portion.avg_power_w else {
-                // Deltas below are power-based; skip segments with no power data.
+            let Some(duration_s) = time.get(end_idx).zip(time.get(start_idx)).map(|(e, s)| e - s).filter(|d| *d > 0.0) else {
                 continue;
             };
+            let power = portion.avg_power_w;
 
-            let history: Vec<(i64, f64)> = sqlx::query_as(
-                "SELECT activity_id, avg_power_w FROM segment_efforts \
-                 WHERE reference_segment_id = ? AND avg_power_w IS NOT NULL \
-                 ORDER BY id ASC",
+            let history: Vec<(i64, Option<f64>, Option<f64>, Option<f64>)> = sqlx::query_as(
+                "SELECT activity_id, avg_power_w, start_time_s, end_time_s FROM segment_efforts \
+                 WHERE reference_segment_id = ? ORDER BY id ASC",
             )
             .bind(seg.id)
             .fetch_all(pool)
             .await?;
-            let powers: Vec<f64> = history.iter().map(|(_, p)| *p).collect();
+            let history: Vec<PastEffort> = history
+                .into_iter()
+                .filter_map(|(activity_id, power_w, start, end)| {
+                    let duration_s = end? - start?;
+                    (duration_s > 0.0).then_some(PastEffort { activity_id, duration_s, power_w })
+                })
+                .collect();
 
-            let pr = history.iter().fold(None::<(i64, f64)>, |acc, &(aid, p)| match acc {
-                Some((_, best)) if best >= p => acc,
-                _ => Some((aid, p)),
+            // Record: the fastest earlier effort (the first one on a tie).
+            let pr = history.iter().fold(None::<&PastEffort>, |best, e| match best {
+                Some(b) if b.duration_s <= e.duration_s => best,
+                _ => Some(e),
             });
-            let recent_avg = mean(&powers[powers.len().saturating_sub(5)..]);
-            let last = history.last().copied();
-
-            let pct_delta = |reference: Option<f64>| {
-                reference.map(|r| (power - r) / r * 100.0)
-            };
+            let last = history.last();
+            let recent = &history[history.len().saturating_sub(5)..];
+            let recent_ref = mean(&recent.iter().map(|e| e.duration_s).collect::<Vec<_>>())
+                .map(|d| (d, mean(&recent.iter().filter_map(|e| e.power_w).collect::<Vec<_>>())));
+            let (pr_s, pr_w) = delta(duration_s, power, pr.map(|e| (e.duration_s, e.power_w)));
+            let (recent_s, recent_w) = delta(duration_s, power, recent_ref);
+            let (last_s, last_w) = delta(duration_s, power, last.map(|e| (e.duration_s, e.power_w)));
 
             sqlx::query(
                 r#"
                 INSERT INTO segment_efforts
                     (activity_id, reference_segment_id, avg_power_w, avg_speed_ms, avg_hr,
-                     delta_vs_pr_pct, delta_vs_recent_avg_pct, delta_vs_last_pct,
+                     delta_vs_pr_s, delta_vs_pr_w, delta_vs_recent_s, delta_vs_recent_w,
+                     delta_vs_last_s, delta_vs_last_w,
                      start_time_s, end_time_s, pr_activity_id, last_activity_id,
                      start_distance_m, end_distance_m)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 "#,
             )
             .bind(activity_id)
@@ -301,13 +336,16 @@ pub async fn run(pool: &SqlitePool) -> anyhow::Result<()> {
             .bind(power)
             .bind(portion.avg_speed_ms)
             .bind(portion.avg_hr)
-            .bind(pct_delta(pr.map(|(_, p)| p)))
-            .bind(pct_delta(recent_avg))
-            .bind(pct_delta(last.map(|(_, p)| p)))
+            .bind(pr_s)
+            .bind(pr_w)
+            .bind(recent_s)
+            .bind(recent_w)
+            .bind(last_s)
+            .bind(last_w)
             .bind(time.get(start_idx).copied())
             .bind(time.get(end_idx).copied())
-            .bind(pr.map(|(aid, _)| aid))
-            .bind(last.map(|(aid, _)| aid))
+            .bind(pr.map(|e| e.activity_id))
+            .bind(last.map(|e| e.activity_id))
             .bind(distance.get(start_idx).copied())
             .bind(distance.get(end_idx).copied())
             .execute(pool)
@@ -315,6 +353,22 @@ pub async fn run(pool: &SqlitePool) -> anyhow::Result<()> {
         }
     }
 
+    Ok(())
+}
+
+/// Efforts stored before the deltas became absolute (time and watts) have none:
+/// any effort after the first one of its segment always has a time delta, so a
+/// missing one means the table predates that change and is rebuilt.
+pub async fn refresh_if_stale(pool: &SqlitePool) -> anyhow::Result<()> {
+    let stale: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM segment_efforts WHERE delta_vs_pr_s IS NULL \
+         AND id > (SELECT MIN(id) FROM segment_efforts e2 WHERE e2.reference_segment_id = segment_efforts.reference_segment_id)",
+    )
+    .fetch_one(pool)
+    .await?;
+    if stale > 0 {
+        run(pool).await?;
+    }
     Ok(())
 }
 
@@ -371,18 +425,31 @@ mod tests {
         pool
     }
 
-    fn segment_streams_json(latlng: [[f64; 2]; 3], watts: [f64; 3]) -> String {
-        serde_json::json!({
+    fn segment_streams_json(latlng: [[f64; 2]; 3], end_time_s: f64, watts: Option<f64>) -> String {
+        let mut v = serde_json::json!({
             "latlng": {"data": latlng},
             "distance": {"data": [0.0, 50.0, 100.0]},
-            "time": {"data": [0.0, 10.0, 20.0]},
-            "watts": {"data": watts},
-        })
-        .to_string()
+            "time": {"data": [0.0, end_time_s / 2.0, end_time_s]},
+        });
+        if let Some(w) = watts {
+            v["watts"] = serde_json::json!({"data": [w, w, w]});
+        }
+        v.to_string()
+    }
+
+    #[test]
+    fn deltas_read_as_time_then_power() {
+        assert_eq!(format_delta(Some(-5.0), Some(13.0)).as_deref(), Some("-5s (+13W)"));
+        assert_eq!(format_delta(Some(-5.0), None).as_deref(), Some("-5s"));
+        assert_eq!(format_delta(Some(7.0), Some(-4.0)).as_deref(), Some("+7s (-4W)"));
+        assert_eq!(format_delta(Some(65.0), None).as_deref(), Some("+1:05"));
+        assert_eq!(format_delta(Some(-125.0), Some(0.0)).as_deref(), Some("-2:05 (+0W)"));
+        assert_eq!(format_delta(Some(0.2), None).as_deref(), Some("0s"));
+        assert_eq!(format_delta(None, Some(5.0)), None);
     }
 
     #[tokio::test]
-    async fn full_pipeline_computes_deltas_chronologically() {
+    async fn full_pipeline_compares_efforts_chronologically_in_seconds_and_watts() {
         let pool = test_pool().await;
 
         sqlx::query(
@@ -393,14 +460,16 @@ mod tests {
         .await
         .unwrap();
 
-        // Two activities on the same segment: first at 200W, second (later) at 220W.
+        // Three rides on the same segment: 20 s at 200 W, then 15 s at 220 W,
+        // then 12 s on a ride with no power meter.
         let latlng = [[49.1000, 6.2000], [49.1005, 6.2005], [49.1010, 6.2010]];
-        for (id, started_at, watts) in [
-            (1i64, "2026-08-01T10:00:00Z", 200.0),
-            (2i64, "2026-08-08T10:00:00Z", 220.0),
+        for (id, started_at, secs, watts) in [
+            (1i64, "2026-08-01T10:00:00Z", 20.0, Some(200.0)),
+            (2i64, "2026-08-08T10:00:00Z", 15.0, Some(220.0)),
+            (3i64, "2026-08-15T10:00:00Z", 12.0, None),
         ] {
             sqlx::query(
-                "INSERT INTO activities (id, started_at, duration_s, distance_m, elevation_gain_m) VALUES (?, ?, 20, 100, 0)",
+                "INSERT INTO activities (id, started_at, sport_type, duration_s, distance_m, elevation_gain_m) VALUES (?, ?, 'Ride', 20, 100, 0)",
             )
             .bind(id)
             .bind(started_at)
@@ -409,7 +478,7 @@ mod tests {
             .unwrap();
             sqlx::query("INSERT INTO activity_streams (activity_id, streams_json) VALUES (?, ?)")
                 .bind(id)
-                .bind(segment_streams_json(latlng, [watts, watts, watts]))
+                .bind(segment_streams_json(latlng, secs, watts))
                 .execute(&pool)
                 .await
                 .unwrap();
@@ -417,29 +486,67 @@ mod tests {
 
         run(&pool).await.unwrap();
 
-        let rows: Vec<(i64, f64, Option<f64>, Option<f64>, Option<f64>)> = sqlx::query_as(
-            "SELECT activity_id, avg_power_w, delta_vs_pr_pct, delta_vs_recent_avg_pct, delta_vs_last_pct \
+        type Row = (i64, Option<f64>, Option<f64>, Option<f64>, Option<f64>, Option<f64>, Option<f64>, Option<f64>, Option<i64>);
+        let rows: Vec<Row> = sqlx::query_as(
+            "SELECT activity_id, avg_power_w, delta_vs_pr_s, delta_vs_pr_w, delta_vs_recent_s, delta_vs_last_s, delta_vs_last_w, \
+                    delta_vs_recent_w, pr_activity_id \
              FROM segment_efforts ORDER BY activity_id",
         )
         .fetch_all(&pool)
         .await
         .unwrap();
+        assert_eq!(rows.len(), 3, "a ride without power is detected too");
 
-        assert_eq!(rows.len(), 2);
-        // First effort has no history: all deltas NULL.
-        assert_eq!(rows[0].0, 1);
-        assert!((rows[0].1 - 200.0).abs() < 1e-9);
-        assert!(rows[0].2.is_none());
-        assert!(rows[0].3.is_none());
-        assert!(rows[0].4.is_none());
+        // First effort: nothing before it.
+        assert_eq!(rows[0].2, None);
+        assert_eq!(rows[0].8, None);
 
-        // Second effort: PR/recent-avg/last are all the first effort's 200W,
-        // so delta = (220-200)/200*100 = 10%.
-        assert_eq!(rows[1].0, 2);
-        assert!((rows[1].1 - 220.0).abs() < 1e-9);
-        assert!((rows[1].2.unwrap() - 10.0).abs() < 1e-9);
-        assert!((rows[1].3.unwrap() - 10.0).abs() < 1e-9);
-        assert!((rows[1].4.unwrap() - 10.0).abs() < 1e-9);
+        // Second: 5 s faster than the first, +20 W.
+        assert_eq!((rows[1].2, rows[1].3), (Some(-5.0), Some(20.0)));
+        assert_eq!(rows[1].8, Some(1));
+
+        // Third, no power: the record is now the second effort (15 s); the
+        // recent average is (20 + 15) / 2 = 17.5 s; the last one is the second.
+        // Its power stays empty and so do the watt differences.
+        assert_eq!(rows[2].1, None);
+        assert_eq!((rows[2].2, rows[2].3), (Some(-3.0), None));
+        assert_eq!(rows[2].4, Some(12.0 - 17.5));
+        assert_eq!((rows[2].5, rows[2].6, rows[2].7), (Some(-3.0), None, None));
+        assert_eq!(rows[2].8, Some(2));
+    }
+
+    #[tokio::test]
+    async fn efforts_stored_before_the_absolute_deltas_are_rebuilt_at_startup() {
+        let pool = test_pool().await;
+        sqlx::query(
+            "INSERT INTO reference_segments (name, start_lat, start_lng, end_lat, end_lng, distance_m, elevation_gain_m) \
+             VALUES ('crux', 49.1000, 6.2000, 49.1010, 6.2010, 100, 0)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let latlng = [[49.1000, 6.2000], [49.1005, 6.2005], [49.1010, 6.2010]];
+        for (id, started_at, secs) in [(1i64, "2026-08-01T10:00:00Z", 20.0), (2i64, "2026-08-08T10:00:00Z", 15.0)] {
+            sqlx::query("INSERT INTO activities (id, started_at, sport_type, duration_s, distance_m, elevation_gain_m) VALUES (?, ?, 'Ride', 20, 100, 0)")
+                .bind(id)
+                .bind(started_at)
+                .execute(&pool)
+                .await
+                .unwrap();
+            sqlx::query("INSERT INTO activity_streams (activity_id, streams_json) VALUES (?, ?)")
+                .bind(id)
+                .bind(segment_streams_json(latlng, secs, None))
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+        run(&pool).await.unwrap();
+        // Simulate rows written by the previous version: efforts without the new deltas.
+        sqlx::query("UPDATE segment_efforts SET delta_vs_pr_s = NULL, delta_vs_pr_w = NULL").execute(&pool).await.unwrap();
+
+        refresh_if_stale(&pool).await.unwrap();
+        let d: Option<f64> = sqlx::query_scalar("SELECT delta_vs_pr_s FROM segment_efforts WHERE activity_id = 2").fetch_one(&pool).await.unwrap();
+        assert_eq!(d, Some(-5.0));
     }
 
     fn gpx(points: &[(f64, f64)]) -> Vec<u8> {

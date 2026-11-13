@@ -138,6 +138,12 @@ mod tests {
         }
         sqlx::query("DROP INDEX idx_activities_source_external").execute(&pool).await.unwrap();
         sqlx::query("ALTER TABLE reference_segments DROP COLUMN track_json").execute(&pool).await.unwrap();
+        for col in ["delta_vs_pr_s", "delta_vs_pr_w", "delta_vs_recent_s", "delta_vs_recent_w", "delta_vs_last_s", "delta_vs_last_w"] {
+            sqlx::query(&format!("ALTER TABLE segment_efforts DROP COLUMN {col}")).execute(&pool).await.unwrap();
+        }
+        for col in ["delta_vs_pr_pct", "delta_vs_recent_avg_pct", "delta_vs_last_pct"] {
+            sqlx::query(&format!("ALTER TABLE segment_efforts ADD COLUMN {col} REAL")).execute(&pool).await.unwrap();
+        }
         for col in ["source", "external_id"] {
             sqlx::query(&format!("ALTER TABLE activities DROP COLUMN {col}")).execute(&pool).await.unwrap();
         }
@@ -177,7 +183,7 @@ mod tests {
 
         migrate(&pool).await.unwrap();
         let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM _sqlx_migrations").fetch_one(&pool).await.unwrap();
-        assert_eq!(n, 14); // initial (adopted) + the thirteen later migrations (applied after)
+        assert_eq!(n, 15); // initial (adopted) + the fourteen later migrations (applied after)
         migrate(&pool).await.unwrap(); // idempotent
     }
 

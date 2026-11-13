@@ -290,8 +290,10 @@ pub(super) async fn activity(State(state): State<AppState>, Path(id): Path<i64>)
         None => Value::Null,
     };
 
-    let efforts: Vec<(String, f64, Option<f64>, Option<f64>, Option<f64>)> = sqlx::query_as(
-        "SELECT rs.name, se.avg_power_w, se.delta_vs_pr_pct, se.delta_vs_recent_avg_pct, se.delta_vs_last_pct \
+    type EffortRow = (String, Option<f64>, Option<f64>, Option<f64>, Option<f64>, Option<f64>, Option<f64>, Option<f64>);
+    let efforts: Vec<EffortRow> = sqlx::query_as(
+        "SELECT rs.name, se.avg_power_w, se.delta_vs_pr_s, se.delta_vs_pr_w, se.delta_vs_recent_s, se.delta_vs_recent_w, \
+                se.delta_vs_last_s, se.delta_vs_last_w \
          FROM segment_efforts se JOIN reference_segments rs ON rs.id = se.reference_segment_id \
          WHERE se.activity_id = ?",
     )
@@ -301,13 +303,17 @@ pub(super) async fn activity(State(state): State<AppState>, Path(id): Path<i64>)
     out["segment_efforts"] = Value::Array(
         efforts
             .into_iter()
-            .map(|(name, power, vs_pr, vs_recent, vs_last)| {
+            .map(|(name, power, pr_s, pr_w, recent_s, recent_w, last_s, last_w)| {
+                // Seconds (negative = faster) and watts (when both efforts have power).
                 json!({
                     "segment": name,
-                    "avg_power_w": round(power, 0),
-                    "delta_vs_pr_pct": vs_pr.map(|v| round(v, 1)),
-                    "delta_vs_recent_avg_pct": vs_recent.map(|v| round(v, 1)),
-                    "delta_vs_last_pct": vs_last.map(|v| round(v, 1)),
+                    "avg_power_w": power.map(|p| round(p, 0)),
+                    "delta_vs_pr_s": pr_s.map(|v| round(v, 0)),
+                    "delta_vs_pr_w": pr_w.map(|v| round(v, 0)),
+                    "delta_vs_recent_s": recent_s.map(|v| round(v, 0)),
+                    "delta_vs_recent_w": recent_w.map(|v| round(v, 0)),
+                    "delta_vs_last_s": last_s.map(|v| round(v, 0)),
+                    "delta_vs_last_w": last_w.map(|v| round(v, 0)),
                 })
             })
             .collect(),

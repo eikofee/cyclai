@@ -93,7 +93,7 @@ Les migrations de `migrations/` sont embarquées dans le binaire et appliquées 
 | `activity_streams` | `streams_json` brut (forme `{clé: {data: [...]}}` : `time`, `watts`, `heartrate`, `latlng`, `altitude`, `distance`, `cadence`) ; volumineux, jamais joint pour la liste |
 | `laps` | Laps (durée, distance, puissance et FC moyennes) |
 | `reference_segments` | Segments favoris : nom, coordonnées départ / arrivée, distance, D+ |
-| `segment_efforts` | Effort détecté : bornes temps / distance, puissance, vitesse, FC, deltas vs record / moyenne / dernier, activités de référence |
+| `segment_efforts` | Effort détecté : bornes temps / distance, puissance, vitesse, FC, écarts (temps en secondes, puissance en watts si elle existe) vs record / moyenne / dernier, activités de référence |
 | `activity_bilans` | Texte du bilan LLM par activité |
 | `digests` | Note libre, résumé envoyé, réponse JSON et texte |
 | `workouts` | Modèles de séances (`steps_json`, `sport`, `source` = `manual` \| `digest`) |
