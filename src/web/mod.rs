@@ -50,6 +50,7 @@ pub async fn serve(pool: SqlitePool, bind: &str) -> anyhow::Result<()> {
         .route("/activity/{id}/context", post(detail::regenerate_bilan))
         .route("/activity/{id}/report", post(detail::activity_report))
         .route("/activity/{id}/description", post(detail::update_description))
+        .route("/activity/{id}/delete", post(detail::delete_activity))
         .route("/workouts", get(workout::list).post(workout::create))
         .route("/workouts/plans/{key}", get(workout::plan_page))
         .route("/workouts/{id}", get(workout::edit_form).post(workout::update))

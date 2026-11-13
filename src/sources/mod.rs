@@ -345,6 +345,50 @@ pub async fn record_ignored(pool: &SqlitePool, source: &str, listed: &Listed, ov
     Ok(())
 }
 
+/// Deletes an activity with everything hanging off it. Planned sessions it was
+/// matched with go back to "planned" (so they can match another ride), and
+/// activities that had been ignored for overlapping it are reconsidered by the
+/// next sync. The deleted activity itself is remembered as ignored, so the
+/// source does not bring it back (`sync --full` forgets that). `false` when
+/// there is no such activity.
+pub async fn delete_activity(pool: &SqlitePool, id: i64) -> anyhow::Result<bool> {
+    let row: Option<(String, Option<String>, String, String)> =
+        sqlx::query_as("SELECT source, external_id, title, started_at FROM activities WHERE id = ?")
+            .bind(id)
+            .fetch_optional(pool)
+            .await?;
+    let Some((source, external_id, title, started_at)) = row else { return Ok(false) };
+
+    let mut tx = pool.begin().await?;
+    for t in ["laps", "activity_bests", "activity_streams", "activity_bilans", "segment_efforts"] {
+        sqlx::query(&format!("DELETE FROM {t} WHERE activity_id = ?")).bind(id).execute(&mut *tx).await?;
+    }
+    for col in ["pr_activity_id", "last_activity_id"] {
+        sqlx::query(&format!("UPDATE segment_efforts SET {col} = NULL WHERE {col} = ?")).bind(id).execute(&mut *tx).await?;
+    }
+    sqlx::query(
+        "UPDATE planned_workouts SET activity_id = NULL, status = CASE WHEN status = 'done' THEN 'planned' ELSE status END          WHERE activity_id = ?",
+    )
+    .bind(id)
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query("DELETE FROM ignored_activities WHERE overlaps_activity_id = ?").bind(id).execute(&mut *tx).await?;
+    sqlx::query("DELETE FROM activities WHERE id = ?").bind(id).execute(&mut *tx).await?;
+    if let Some(external_id) = external_id {
+        sqlx::query(
+            "INSERT OR REPLACE INTO ignored_activities (source, external_id, overlaps_activity_id, title, started_at) VALUES (?, ?, NULL, ?, ?)",
+        )
+        .bind(&source)
+        .bind(&external_id)
+        .bind(&title)
+        .bind(&started_at)
+        .execute(&mut *tx)
+        .await?;
+    }
+    tx.commit().await?;
+    Ok(true)
+}
+
 /// An already stored activity that shares more than `tolerance_s` seconds with
 /// `[start_epoch, start_epoch + duration_s]`.
 pub async fn find_overlap(pool: &SqlitePool, start_epoch: i64, duration_s: i64, tolerance_s: i64) -> Option<i64> {
@@ -605,5 +649,44 @@ mod tests {
         assert!(is_ignored(&pool, "alpha", "42").await);
         forget_ignored(&pool, "alpha").await.unwrap();
         assert!(!is_ignored(&pool, "alpha", "42").await);
+    }
+
+    #[tokio::test]
+    async fn deleting_an_activity_clears_what_hangs_off_it_and_keeps_the_source_from_bringing_it_back() {
+        let pool = pool().await;
+        let a = insert(&pool, &activity("alpha", "a1", "2026-11-10T08:00:00Z", 3600)).await.unwrap();
+        let b = insert(&pool, &activity("file", "b1", "2026-11-11T08:00:00Z", 3600)).await.unwrap();
+        sqlx::query("INSERT INTO activity_bilans (activity_id, text) VALUES (?, 'x')").bind(a).execute(&pool).await.unwrap();
+        // Another source's activity that was ignored for overlapping `a`.
+        sqlx::query("INSERT INTO ignored_activities (source, external_id, overlaps_activity_id) VALUES ('garmin', 'g1', ?)")
+            .bind(a)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO planned_workouts (planned_date, name, sport, steps_json, source, status, activity_id) VALUES ('2026-11-10', 't', 'cycling', '[]', 'user', 'done', ?)",
+        )
+        .bind(a)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        assert!(delete_activity(&pool, a).await.unwrap());
+        assert!(!delete_activity(&pool, a).await.unwrap(), "already gone");
+
+        let count = |sql: &'static str| {
+            let pool = pool.clone();
+            async move { sqlx::query_scalar::<_, i64>(sql).fetch_one(&pool).await.unwrap() }
+        };
+        assert_eq!(count("SELECT COUNT(*) FROM activities").await, 1, "the other activity stays");
+        assert_eq!(count("SELECT COUNT(*) FROM activity_streams").await, 1);
+        assert_eq!(count("SELECT COUNT(*) FROM activity_bilans").await, 0);
+        assert!(!is_ignored(&pool, "garmin", "g1").await, "what overlapped it is reconsidered");
+        assert!(is_ignored(&pool, "alpha", "a1").await, "and it is not brought back");
+        let (status, linked): (String, Option<i64>) =
+            sqlx::query_as("SELECT status, activity_id FROM planned_workouts").fetch_one(&pool).await.unwrap();
+        assert_eq!((status.as_str(), linked), ("planned", None));
+        assert!(is_known(&pool, "file", "b1").await);
+        let _ = b;
     }
 }

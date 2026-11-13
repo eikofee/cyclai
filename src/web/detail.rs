@@ -1220,6 +1220,9 @@ pub async fn activity_detail(
 {bilan_html}
 {edit_html}
 {source_link_html}
+<form method="post" action="/activity/{id}/delete" class="delete-activity" onsubmit="return confirm('Supprimer cette activité ? Elle ne sera pas réimportée par les synchronisations suivantes.');">
+<button type="submit" class="danger">Supprimer l'activité</button>
+</form>
 </section>
 
 <section>
@@ -1336,6 +1339,24 @@ pub async fn update_description(
         .await;
 
     Redirect::to(&format!("/activity/{id}"))
+}
+
+/// Deletes the activity and everything attached to it, then refreshes the
+/// training load (which was computed with it).
+pub async fn delete_activity(State(state): State<AppState>, Path(id): Path<i64>) -> Redirect {
+    match crate::sources::delete_activity(&state.pool, id).await {
+        Ok(true) => {
+            if let Err(err) = crate::metrics::run(&state.pool).await {
+                tracing::error!(?err, activity_id = id, "activity delete: metrics recompute failed");
+            }
+            Redirect::to("/")
+        }
+        Ok(false) => Redirect::to("/"),
+        Err(err) => {
+            tracing::error!(?err, activity_id = id, "activity delete failed");
+            Redirect::to(&format!("/activity/{id}"))
+        }
+    }
 }
 
 #[derive(Deserialize)]

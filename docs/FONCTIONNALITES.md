@@ -176,6 +176,7 @@ CyclAI peut être piloté par un agent (Claude) sans jamais lui laisser le derni
 - **Courbe de puissance** : meilleures moyennes sur 5 s, 15 s, 30 s, 1, 5, 10 et 20 min.
 - **Segments** détectés et leurs deltas.
 - **Bilan**, titre et description de la source, contexte libre, lien vers l'activité sur le site de sa source.
+- **Suppression** de l'activité (bouton en bas du résumé, avec confirmation) : tours, courbes, bilan et efforts sur segments partent avec elle, la séance planifiée associée redevient « planifiée », la charge est recalculée. La source ne la ramène pas aux synchronisations suivantes (`sync --full` oublie cette mémoire), et les activités qu'elle avait fait écarter sont réexaminées.
 
 Couleurs communes à tous les outils de l'utilisateur : FC rouge, vitesse bleu clair, cadence orange, puissance mauve, altitude gris.
 
