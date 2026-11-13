@@ -235,8 +235,9 @@ async fn render(state: &AppState, selected: Option<i64>, error: Option<&str>) ->
             .map(|s| {
                 let active = if Some(s.id) == selected { r#" class="seg-active""# } else { "" };
                 format!(
-                    r#"<tr{active}><td><a href="/segments?id={id}">{name}</a></td><td>{km:.2} km</td><td>{d:.0} m</td><td>{n}</td><td>{p}</td><td>{last}</td></tr>"#,
+                    r#"<tr{active}><td><a href="/segments?id={id}">{name}</a></td><td>{km:.2} km</td><td>{d:.0} m</td><td>{n}</td><td>{p}</td><td>{last}</td><td class="seg-del-cell"><form method="post" action="/segments/{id}/delete" onsubmit="return confirm('Supprimer le segment « {js_name} » et ses passages détectés ? Tes sorties ne sont pas touchées.');"><button type="submit" class="seg-del" title="Supprimer ce segment" aria-label="Supprimer ce segment">🗑</button></form></td></tr>"#,
                     id = s.id,
+                    js_name = escape_html(&s.name.replace('\\', " ").replace('\'', "’")),
                     name = escape_html(&s.name),
                     km = s.distance_m / 1000.0,
                     d = s.elevation_gain_m,
@@ -247,7 +248,7 @@ async fn render(state: &AppState, selected: Option<i64>, error: Option<&str>) ->
             })
             .collect();
         format!(
-            r#"<div class="table-wrap"><table class="records-table seg-table"><thead><tr><th>Segment</th><th>Distance</th><th>D+</th><th>Passages</th><th>Meilleure puissance</th><th>Dernier passage</th></tr></thead><tbody>{body}</tbody></table></div>"#
+            r#"<div class="table-wrap"><table class="records-table seg-table"><thead><tr><th>Segment</th><th>Distance</th><th>D+</th><th>Passages</th><th>Meilleure puissance</th><th>Dernier passage</th><th></th></tr></thead><tbody>{body}</tbody></table></div>"#
         )
     };
 
@@ -425,9 +426,6 @@ async fn render_detail(state: &AppState, seg: &SegmentRow) -> String {
     format!(
         r#"<section>
 <h2>{name}</h2>
-<form method="post" action="/segments/{id}/delete" onsubmit="return confirm('Supprimer ce segment et ses passages détectés ? Tes sorties ne sont pas touchées.');">
-<button type="submit" class="danger">Supprimer le segment</button>
-</form>
 <div class="stats">{stats}</div>
 {map_html}
 {profile_html}
@@ -438,13 +436,16 @@ async fn render_detail(state: &AppState, seg: &SegmentRow) -> String {
 </section>
 {script}"#,
         name = escape_html(&seg.name),
-        id = seg.id,
     )
 }
 
 const CSS: &str = r#".seg-map { height: 380px; border-radius: 8px; margin-bottom: 1rem; }
 .seg-chart-wrap { height: 240px; }
 .seg-table tr.seg-active td { background: var(--accent-soft); }
+.seg-del-cell { width: 1%; white-space: nowrap; text-align: right; }
+.seg-del-cell form { margin: 0; }
+.seg-del { background: none; border: 1px solid transparent; padding: .15rem .4rem; font-size: 1rem; line-height: 1; cursor: pointer; opacity: .55; }
+.seg-del:hover { opacity: 1; border-color: var(--danger-border); background: var(--danger-soft); }
 .grade-legend { display: flex; flex-wrap: wrap; gap: 0.8rem; font-size: 0.75rem; color: var(--text-muted); margin-bottom: 0.6rem; }
 .grade-legend i { display: inline-block; width: 12px; height: 12px; border-radius: 3px; margin-right: 4px; vertical-align: -2px; }
 .table-wrap { overflow-x: auto; }
