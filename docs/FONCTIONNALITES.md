@@ -175,6 +175,7 @@ CyclAI peut être piloté par un agent (Claude) sans jamais lui laisser le derni
 - **Zones** de puissance (7) et de FC (5) : barres par zone (une barre pleine = max(zone la plus longue, 60 %) pour rester lisible), durées en `H:MM:SS`, plage en W / bpm au survol.
 - **Courbe de puissance** : meilleures moyennes sur 5 s, 15 s, 30 s, 1, 5, 10 et 20 min.
 - **Segments** détectés et leurs deltas.
+- **Courbes** (puissance, FC, vitesse ou allure, cadence, altitude) en fonction de la distance ou du temps (sélecteur « Axe ») ; sans distance (home-trainer, capteur absent), le temps est l'axe par défaut.
 - **Bilan**, titre et description de la source, contexte libre, lien vers l'activité sur le site de sa source.
 - **Suppression** de l'activité (bouton en bas du résumé, avec confirmation) : tours, courbes, bilan et efforts sur segments partent avec elle, la séance planifiée associée redevient « planifiée », la charge est recalculée. La source ne la ramène pas aux synchronisations suivantes (`sync --full` oublie cette mémoire), et les activités qu'elle avait fait écarter sont réexaminées.
 

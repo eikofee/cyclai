@@ -321,7 +321,10 @@ fn render_combo_chart(
     cadence: Option<&[f64]>,
     is_run: bool,
 ) -> String {
-    let n = distance_km.len().min(time_min.len());
+    // An activity can have no distance at all (indoor, no sensor): the chart
+    // then runs on elapsed time. With a distance the user can switch between both.
+    let has_dist = distance_km.last().is_some_and(|d| *d > 0.0);
+    let n = if has_dist { distance_km.len().min(time_min.len()) } else { time_min.len() };
     if n < 2 {
         return "<p class=\"hint\">Pas de données</p>".to_string();
     }
@@ -332,7 +335,7 @@ fn render_combo_chart(
     // entirely, i.e. full resolution everywhere; only very long activities
     // still downsample, and even then far less aggressively.
     let indices = downsample_indices(n, 8000);
-    let x_values: Vec<f64> = indices.iter().map(|&i| distance_km[i]).collect();
+    let x_values: Vec<f64> = if has_dist { indices.iter().map(|&i| distance_km[i]).collect() } else { Vec::new() };
     let t_values: Vec<f64> = indices.iter().map(|&i| time_min[i]).collect();
     let alt = pick(altitude, &indices);
     let pw = pick(power, &indices);
@@ -436,17 +439,25 @@ fn render_combo_chart(
             })
             .collect()
     };
-    let selectors_html = if available.len() >= 2 {
+    let mode_html = if has_dist {
+        "<label>Axe <select id=\"x-mode\"><option value=\"dist\">Distance</option><option value=\"time\">Temps</option></select></label>"
+    } else {
+        ""
+    };
+    let series_html = if available.len() >= 2 {
         format!(
-            "<div class=\"chart-selectors\">\
-             <label><span class=\"dot\" id=\"select1-dot\"></span>Courbe 1 <select id=\"series-select-1\">{}</select></label>\
-             <label><span class=\"dot\" id=\"select2-dot\"></span>Courbe 2 <select id=\"series-select-2\">{}</select></label>\
-             </div>",
+            "<label><span class=\"dot\" id=\"select1-dot\"></span>Courbe 1 <select id=\"series-select-1\">{}</select></label>\
+             <label><span class=\"dot\" id=\"select2-dot\"></span>Courbe 2 <select id=\"series-select-2\">{}</select></label>",
             option_tags(0),
             option_tags(1)
         )
     } else {
         String::new()
+    };
+    let selectors_html = if mode_html.is_empty() && series_html.is_empty() {
+        String::new()
+    } else {
+        format!("<div class=\"chart-selectors\">{mode_html}{series_html}</div>")
     };
     let colors_js: String = available
         .iter()
@@ -456,8 +467,6 @@ fn render_combo_chart(
 
     let x_json = serde_json::to_string(&x_values).unwrap();
     let t_json = serde_json::to_string(&t_values).unwrap();
-    let x_min = x_values.first().copied().unwrap_or(0.0);
-    let x_max = x_values.last().copied().unwrap_or(0.0);
     let datasets_js = datasets.join(",");
     let scales_js = scales.join(",\n        ");
     let full_series_js = full_series.join(",");
@@ -475,8 +484,11 @@ fn render_combo_chart(
   if (!Chart.Tooltip.positioners.cursor) {{
     Chart.Tooltip.positioners.cursor = function(elements, eventPosition) {{ return eventPosition; }};
   }}
-  const X = {x_json};
-  const T = {t_json};
+  const X = {x_json};  // km, empty when the activity has no distance
+  const T = {t_json};  // elapsed minutes
+  const HAS_DIST = X.length > 0;
+  let mode = HAS_DIST ? 'dist' : 'time';
+  const xs = () => mode === 'dist' ? X : T;
   const FULL = {{ {full_series_js} }};
   // Whatever the current zoom window, at most this many points are ever
   // handed to a dataset — a lap/segment zoom stays exactly as readable as
@@ -504,9 +516,20 @@ fn render_combo_chart(
     const i = Math.min(lowerBound(X, km), X.length - 1);
     return T[i];
   }}
+  function nearestKm(min) {{
+    return X[Math.min(lowerBound(T, min), X.length - 1)];
+  }}
+  // Positions given in km or in minutes (laps, segments, map) -> the current x axis.
+  const kmToAxis = (km) => mode === 'dist' ? km : nearestT(km);
+  const minToAxis = (min) => mode === 'time' ? min : nearestKm(min);
+  const toAxis = (v, unit) => unit === 'min' ? minToAxis(v) : kmToAxis(v);
+  const fmtX = (v) => mode === 'dist' ? fmtKm(v) : fmtTime(v);
+  function fullRange() {{ const a = xs(); return [a[0], a[a.length - 1]]; }}
+  window.kmToAxis = kmToAxis;
   function applyResample(xMin, xMax) {{
-    const lo = lowerBound(X, xMin);
-    const hi = Math.min(lowerBound(X, xMax) + 1, X.length);
+    const A = xs();
+    const lo = lowerBound(A, xMin);
+    const hi = Math.min(lowerBound(A, xMax) + 1, A.length);
     const count = Math.max(0, hi - lo);
     const stride = Math.max(1, Math.ceil(count / MAX_VISIBLE_POINTS));
     const idxs = [];
@@ -514,12 +537,13 @@ fn render_combo_chart(
     chart.data.datasets.forEach(ds => {{
       if (!ds._fullKey) return;
       const src = FULL[ds._fullKey];
-      ds.data = idxs.map(i => ({{x: X[i], y: src[i]}}));
+      ds.data = idxs.map(i => ({{x: A[i], y: src[i]}}));
     }});
   }}
+  const [X0, X1] = fullRange();
   const chart = new Chart(ctx, {{
     type: 'line',
-    data: {{ labels: X, datasets: [{datasets_js}] }},
+    data: {{ labels: xs(), datasets: [{datasets_js}] }},
     options: {{
       responsive: true,
       maintainAspectRatio: false,
@@ -528,7 +552,7 @@ fn render_combo_chart(
       onHover: function(evt, elements) {{
         if (elements.length) {{
           const xVal = chart.scales.x.getValueForPixel(evt.x);
-          if (window.showMapPointAtDistance) window.showMapPointAtDistance(xVal);
+          if (HAS_DIST && window.showMapPointAtDistance) window.showMapPointAtDistance(mode === 'dist' ? xVal : nearestKm(xVal));
         }} else if (window.clearMapPoint) {{
           window.clearMapPoint();
         }}
@@ -539,7 +563,12 @@ fn render_combo_chart(
           mode: 'x', intersect: false, position: 'cursor',
           filter: (item, index, items) => items.findIndex(i => i.datasetIndex === item.datasetIndex) === index,
           callbacks: {{
-            title: (items) => items.length ? fmtKm(items[0].parsed.x) + ' (' + fmtTime(nearestT(items[0].parsed.x)) + ')' : '',
+            title: (items) => {{
+              if (!items.length) return '';
+              const v = items[0].parsed.x;
+              if (mode === 'dist') return fmtKm(v) + ' (' + fmtTime(nearestT(v)) + ')';
+              return HAS_DIST ? fmtTime(v) + ' (' + fmtKm(nearestKm(v)) + ')' : fmtTime(v);
+            }},
             label: (item) => IS_RUN && item.dataset.key === 'speed'
               ? 'Allure: ' + fmtPace(item.parsed.y) + ' /km'
               : item.dataset.label + ': ' + item.formattedValue
@@ -550,7 +579,7 @@ fn render_combo_chart(
         }} }} }}
       }},
       scales: {{
-        x: {{ type: 'linear', min: {x_min}, max: {x_max}, ticks: {{ maxTicksLimit: 8, color: '#9ca3af', callback: (v) => fmtKm(v) }}, grid: {{ display: false }} }},
+        x: {{ type: 'linear', min: X0, max: X1, ticks: {{ maxTicksLimit: 8, color: '#9ca3af', callback: (v) => fmtX(v) }}, grid: {{ display: false }} }},
         {scales_js}
       }}
     }}
@@ -591,32 +620,49 @@ fn render_combo_chart(
     applySelection();
   }}
 
-  window.zoomToRange = function(startMin, endMin) {{
-    chart.options.scales.x.min = startMin;
-    chart.options.scales.x.max = endMin;
-    applyResample(startMin, endMin);
+  window.zoomToRange = function(start, end, unit) {{
+    start = toAxis(start, unit); end = toAxis(end, unit);
+    chart.options.scales.x.min = start;
+    chart.options.scales.x.max = end;
+    applyResample(start, end);
     chart.update();
     document.querySelectorAll('.lap-row').forEach(el => el.classList.remove('lap-row-active'));
   }};
   window.resetZoom = function() {{
-    chart.options.scales.x.min = {x_min};
-    chart.options.scales.x.max = {x_max};
-    applyResample({x_min}, {x_max});
+    const [lo, hi] = fullRange();
+    chart.options.scales.x.min = lo;
+    chart.options.scales.x.max = hi;
+    applyResample(lo, hi);
     chart.update();
     document.querySelectorAll('.lap-row').forEach(el => el.classList.remove('lap-row-active'));
     if (window.resetZoneHighlight) window.resetZoneHighlight();
   }};
   // Hover preview (before committing to a zoom): shaded band on the chart,
   // does not touch the x-axis min/max so it doesn't fight with an active zoom.
-  window.previewLap = function(startMin, endMin) {{
+  window.previewLap = function(start, end, unit) {{
     const ann = chart.options.plugins.annotation.annotations.hoverBand;
-    ann.xMin = startMin; ann.xMax = endMin; ann.display = true;
+    ann.xMin = toAxis(start, unit); ann.xMax = toAxis(end, unit); ann.display = true;
     chart.update('none');
   }};
   window.clearLapPreview = function() {{
     chart.options.plugins.annotation.annotations.hoverBand.display = false;
     chart.update('none');
   }};
+
+  // Distance <-> time on the x axis. A switch drops the zoom and any segment
+  // overlay, whose positions were expressed on the previous axis.
+  const modeSel = document.getElementById('x-mode');
+  if (modeSel) {{
+    modeSel.addEventListener('change', function() {{
+      mode = modeSel.value;
+      chart.data.datasets = chart.data.datasets.filter(ds => !ds.overlay);
+      document.querySelectorAll('.segment-overlay-cb').forEach(cb => cb.checked = false);
+      chart.data.labels = xs();
+      chart.options.plugins.annotation.annotations.hoverBand.display = false;
+      window.resetZoom();
+      if (window.applyChartSelection) window.applyChartSelection();
+    }});
+  }}
 }})();
 </script>"##,
     )
@@ -1028,15 +1074,17 @@ pub async fn activity_detail(
             .enumerate()
             .map(|(pos, l)| {
                 let start_km = distance_at_time_s(&time, distance.as_deref().unwrap_or(&[]), cursor_s as f64) / 1000.0;
+                let start_min = cursor_s as f64 / 60.0;
                 cursor_s += l.elapsed_time_s;
+                let end_min = cursor_s as f64 / 60.0;
                 let end_km = distance_at_time_s(&time, distance.as_deref().unwrap_or(&[]), cursor_s as f64) / 1000.0;
                 // Position in the sorted list, matching LAP_ZONES — the stored
                 // `lap_index` is 0-based from plugins but 1-based from file imports.
                 let lap_index = pos + 1;
                 format!(
                     "<tr class=\"lap-row\" \
-                     onclick=\"window.zoomToRange({start_km},{end_km});window.highlightLapInZones && window.highlightLapInZones({lap_index});this.classList.add('lap-row-active')\" \
-                     onmouseenter=\"window.previewLap && window.previewLap({start_km},{end_km});window.highlightLapOnMap && window.highlightLapOnMap({start_km},{end_km})\" \
+                     onclick=\"window.zoomToRange({start_min},{end_min},'min');window.highlightLapInZones && window.highlightLapInZones({lap_index});this.classList.add('lap-row-active')\" \
+                     onmouseenter=\"window.previewLap && window.previewLap({start_min},{end_min},'min');window.highlightLapOnMap && window.highlightLapOnMap({start_km},{end_km})\" \
                      onmouseleave=\"window.clearLapPreview && window.clearLapPreview();window.clearLapMapHighlight && window.clearLapMapHighlight()\">\
                      <td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
                     l.lap_index,
@@ -1094,7 +1142,7 @@ pub async fn activity_detail(
                  if (curve && curve.power) {{\
                    chart.data.datasets.push({{\
                      label: label + ' — Puissance (W)', overlay: true,\
-                     data: curve.distance_km.map((d, i) => ({{x: seg.start_km + d, y: curve.power[i]}})),\
+                     data: curve.distance_km.map((d, i) => ({{x: window.kmToAxis(seg.start_km + d), y: curve.power[i]}})),\
                      borderColor: '{power_color}', borderDash: [5, 4], borderWidth: 1.5, pointRadius: 0,\
                      yAxisID: 'y_power', tension: 0.2,\
                    }});\
@@ -1103,7 +1151,7 @@ pub async fn activity_detail(
                  if (curve && curve.hr) {{\
                    chart.data.datasets.push({{\
                      label: label + ' — FC (bpm)', overlay: true,\
-                     data: curve.distance_km.map((d, i) => ({{x: seg.start_km + d, y: curve.hr[i]}})),\
+                     data: curve.distance_km.map((d, i) => ({{x: window.kmToAxis(seg.start_km + d), y: curve.hr[i]}})),\
                      borderColor: '{hr_color}', borderDash: [5, 4], borderWidth: 1.5, pointRadius: 0,\
                      yAxisID: 'y_hr', tension: 0.2,\
                    }});\
@@ -1528,3 +1576,33 @@ const DETAIL_CSS: &str = r##".chart-block { margin-bottom: 1.2rem; }
   .combo-wrap { height: 500px; }
 }
 "##;
+
+#[cfg(test)]
+mod chart_axis_tests {
+    use super::render_combo_chart;
+
+    fn minutes(n: usize) -> Vec<f64> {
+        (0..n).map(|i| i as f64 / 60.0).collect()
+    }
+
+    #[test]
+    fn an_activity_without_distance_is_charted_against_time() {
+        let time = minutes(120);
+        let power: Vec<f64> = (0..120).map(|i| 150.0 + i as f64).collect();
+        let html = render_combo_chart(&[], &time, None, Some(&power), None, None, None, false);
+        assert!(html.contains("combo-chart"), "a chart is drawn");
+        assert!(!html.contains("Pas de données"));
+        assert!(!html.contains(r#"id="x-mode""#), "nothing to switch to without a distance");
+        assert!(html.contains("const X = [];"), "no distance axis");
+    }
+
+    #[test]
+    fn an_activity_with_a_distance_can_switch_between_distance_and_time() {
+        let time = minutes(120);
+        let km: Vec<f64> = (0..120).map(|i| i as f64 * 0.01).collect();
+        let power: Vec<f64> = vec![200.0; 120];
+        let html = render_combo_chart(&km, &time, None, Some(&power), None, None, None, false);
+        assert!(html.contains(r#"id="x-mode""#));
+        assert!(html.contains(r#"<option value="time">Temps</option>"#));
+    }
+}
