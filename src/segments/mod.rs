@@ -45,6 +45,16 @@ fn segment_track(streams: &serde_json::Value) -> Option<String> {
     Some(out.to_string())
 }
 
+/// Deletes a reference segment and every effort detected on it. `false` when
+/// there is no such segment. Activities themselves are untouched.
+pub async fn delete(pool: &SqlitePool, id: i64) -> anyhow::Result<bool> {
+    let mut tx = pool.begin().await?;
+    sqlx::query("DELETE FROM segment_efforts WHERE reference_segment_id = ?").bind(id).execute(&mut *tx).await?;
+    let removed = sqlx::query("DELETE FROM reference_segments WHERE id = ?").bind(id).execute(&mut *tx).await?.rows_affected();
+    tx.commit().await?;
+    Ok(removed > 0)
+}
+
 /// Creates (or updates, by name) a reference segment from a GPX file: its
 /// start and end are the first and last points of the track. Returns its id.
 /// The detection then runs again over every stored ride.
@@ -478,5 +488,31 @@ mod tests {
         assert!(import_gpx(&pool, "x", b"not a gpx").await.is_err());
         let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM reference_segments").fetch_one(&pool).await.unwrap();
         assert_eq!(n, 0, "nothing stored on refusal");
+    }
+
+    #[tokio::test]
+    async fn deleting_a_segment_removes_its_efforts_and_nothing_else() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new().connect("sqlite::memory:").await.unwrap();
+        crate::db::migrate(&pool).await.unwrap();
+        let pts: String = (0..=10)
+            .map(|i| format!(r#"<trkpt lat="{}" lon="5.0"><ele>200</ele></trkpt>"#, 45.0 + i as f64 * 0.0009))
+            .collect();
+        let gpx = format!(r#"<?xml version="1.0"?><gpx version="1.1" creator="t" xmlns="http://www.topografix.com/GPX/1/1"><trk><trkseg>{pts}</trkseg></trk></gpx>"#);
+        let a = import_gpx(&pool, "A", gpx.as_bytes()).await.unwrap();
+        let b = import_gpx(&pool, "B", gpx.as_bytes()).await.unwrap();
+        sqlx::query("INSERT INTO activities (id, started_at, sport_type, duration_s, distance_m, elevation_gain_m, title) VALUES (-1, '2026-11-10T08:00:00Z', 'Ride', 600, 1000, 0, 't')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        for seg in [a, b] {
+            sqlx::query("INSERT INTO segment_efforts (activity_id, reference_segment_id) VALUES (-1, ?)").bind(seg).execute(&pool).await.unwrap();
+        }
+
+        assert!(delete(&pool, a).await.unwrap());
+        assert!(!delete(&pool, a).await.unwrap(), "already gone");
+        let segments: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM reference_segments").fetch_one(&pool).await.unwrap();
+        let efforts: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM segment_efforts WHERE reference_segment_id = ?").bind(b).fetch_one(&pool).await.unwrap();
+        let activities: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM activities").fetch_one(&pool).await.unwrap();
+        assert_eq!((segments, efforts, activities), (1, 1, 1));
     }
 }

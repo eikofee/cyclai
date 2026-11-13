@@ -22,6 +22,15 @@ pub async fn page(State(state): State<AppState>, Query(q): Query<SegmentsQuery>)
     Html(render(&state, q.id, None).await)
 }
 
+/// `POST /segments/{id}/delete` — the segment and its detected efforts.
+pub async fn delete(State(state): State<AppState>, axum::extract::Path(id): axum::extract::Path<i64>) -> Redirect {
+    if let Err(err) = crate::segments::delete(&state.pool, id).await {
+        tracing::error!(?err, segment_id = id, "segment delete failed");
+        return Redirect::to(&format!("/segments?id={id}"));
+    }
+    Redirect::to("/segments")
+}
+
 /// `POST /segments/import` — a segment from a GPX file (+ an optional name).
 pub async fn import(State(state): State<AppState>, mut multipart: axum::extract::Multipart) -> Response {
     let (mut name, mut file_name, mut bytes) = (String::new(), None, None);
@@ -416,6 +425,9 @@ async fn render_detail(state: &AppState, seg: &SegmentRow) -> String {
     format!(
         r#"<section>
 <h2>{name}</h2>
+<form method="post" action="/segments/{id}/delete" onsubmit="return confirm('Supprimer ce segment et ses passages détectés ? Tes sorties ne sont pas touchées.');">
+<button type="submit" class="danger">Supprimer le segment</button>
+</form>
 <div class="stats">{stats}</div>
 {map_html}
 {profile_html}
@@ -426,6 +438,7 @@ async fn render_detail(state: &AppState, seg: &SegmentRow) -> String {
 </section>
 {script}"#,
         name = escape_html(&seg.name),
+        id = seg.id,
     )
 }
 

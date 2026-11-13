@@ -76,6 +76,7 @@ pub async fn serve(pool: SqlitePool, bind: &str) -> anyhow::Result<()> {
         .route("/stats", get(stats::page))
         .route("/segments", get(segments::page))
         .route("/segments/import", post(segments::import))
+        .route("/segments/{id}/delete", post(segments::delete))
         .route("/settings", get(settings::page))
         .route("/settings/sources", post(settings::update_sources))
         .route("/settings/keys", post(settings::update_keys))
