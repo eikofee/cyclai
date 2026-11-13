@@ -32,7 +32,7 @@ Le bouton **Synchroniser** (ou `cyclai sync`) interroge **tous les plugins activ
 
 ### Vélo et course à pied
 
-- **Vélo de route (`Ride`)** : pipeline complet — puissance, TSS/IF, zones, segments, bilan.
+- **Vélo de route et gravel (`Ride`, `GravelRide`)** : pipeline complet — puissance, TSS/IF, zones, segments, bilan.
 - **Course (`Run`, `TrailRun`)** : allure en **min/km** (liste, détail, laps, courbe d'allure) et FC. Pas de puissance, de zones de puissance ni de segments. Le bilan ne parle que d'allure, de FC et de dénivelé.
 
 ## Métriques d'entraînement

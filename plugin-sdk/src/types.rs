@@ -13,7 +13,7 @@ pub struct Manifest {
     /// Name shown in the settings page.
     pub label: String,
     pub version: String,
-    /// Sports it can bring (`Ride`, `VirtualRide`, `Run`, `TrailRun`).
+    /// Sports it can bring (`Ride`, `GravelRide`, `VirtualRide`, `Run`, `TrailRun`).
     #[serde(default)]
     pub sports: Vec<String>,
     /// False while credentials are missing; CyclAI then does not sync it.

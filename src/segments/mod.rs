@@ -254,7 +254,7 @@ pub async fn run(pool: &SqlitePool) -> anyhow::Result<()> {
         SELECT a.id, s.streams_json
         FROM activities a
         JOIN activity_streams s ON s.activity_id = a.id
-        WHERE a.sport_type = 'Ride'
+        WHERE a.sport_type IN ('Ride', 'GravelRide')
         ORDER BY a.started_at ASC
         "#,
     )

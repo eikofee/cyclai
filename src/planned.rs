@@ -247,7 +247,7 @@ pub async fn reconcile(pool: &SqlitePool, today: NaiveDate) -> anyhow::Result<u6
     let mut done = 0;
     for (id, date, sport) in pending {
         let types = match Sport::from_db(&sport) {
-            Sport::Cycling => "('Ride', 'VirtualRide')",
+            Sport::Cycling => "('Ride', 'GravelRide', 'VirtualRide')",
             Sport::Running => "('Run', 'TrailRun')",
             Sport::Other => continue,
         };

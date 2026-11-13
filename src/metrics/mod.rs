@@ -5,13 +5,13 @@ use sqlx::SqlitePool;
 /// (NP/TSS/IF/zones/segments); runs get pace + HR and an HR-based TSS
 /// (`hr_tss`), and no power zones/segments.
 pub fn is_supported_sport(sport_type: &str) -> bool {
-    matches!(sport_type, "Ride" | "VirtualRide" | "Run" | "TrailRun")
+    matches!(sport_type, "Ride" | "GravelRide" | "VirtualRide" | "Run" | "TrailRun")
 }
 
 /// Road rides and indoor/trainer rides (`VirtualRide`: Zwift, smart
 /// trainer) share the power-based pipeline.
 pub fn is_ride(sport_type: &str) -> bool {
-    matches!(sport_type, "Ride" | "VirtualRide")
+    matches!(sport_type, "Ride" | "GravelRide" | "VirtualRide")
 }
 
 pub fn is_run(sport_type: &str) -> bool {

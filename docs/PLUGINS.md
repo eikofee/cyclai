@@ -44,7 +44,7 @@ Version 1, HTTP/1.1, JSON. Le crate [`plugin-sdk`](../plugin-sdk) fournit les ty
 | `GET /activities/{external_id}` | une activité en JSON (`application/json`), ou le `.fit` d'origine (`application/vnd.ant.fit`) ; **404** s'il n'y a rien à importer |
 
 - `id` : 1 à 32 minuscules ou chiffres, identique à celui déclaré dans `CYCLAI_PLUGINS`. Il est enregistré avec chaque activité (`source`).
-- `sport_type` : `Ride`, `VirtualRide`, `Run` ou `TrailRun` ; le reste est écarté par CyclAI.
+- `sport_type` : `Ride`, `GravelRide`, `VirtualRide`, `Run` ou `TrailRun` ; le reste est écarté par CyclAI.
 - `duration_s` dans la liste est facultatif mais utile : s'il est connu, une activité qui chevauche une autre est écartée **avant** d'être téléchargée.
 - `activity_url` est un modèle de lien vers l'activité sur le site de la source (`https://…/{id}`, en HTTPS, avec `{id}`) ; il alimente le lien « voir sur … » des pages d'activité.
 - L'activité JSON porte `started_at` (RFC 3339), `sport_type`, `duration_s`, `distance_m`, `elevation_gain_m`, la puissance (moyenne et normalisée, vélo seulement), la FC, `title`, `description?`, des `streams` (`{"time": {"data": [...]}, "watts": …, "heartrate": …, "latlng": …, "altitude": …, "distance": …, "cadence": …}`) et des `laps`. Renvoyer le `.fit` d'origine est plus simple : CyclAI sait l'analyser.

@@ -230,7 +230,7 @@ pub(super) async fn activities(State(state): State<AppState>, Query(q): Query<Ac
     // No `days` means no lower bound: every started_at sorts after "".
     let since = q.days.map(|d| days_ago(d.clamp(1, 3650))).unwrap_or_default();
     let sport_filter = match q.sport.as_deref() {
-        Some("ride") => "AND sport_type IN ('Ride', 'VirtualRide')",
+        Some("ride") => "AND sport_type IN ('Ride', 'GravelRide', 'VirtualRide')",
         Some("run") => "AND sport_type IN ('Run', 'TrailRun')",
         _ => "",
     };
@@ -910,7 +910,7 @@ pub(super) async fn ride_envelope(State(state): State<AppState>, Query(q): Query
     // Rides of the last year with a TSS, to learn what each kind of ride costs.
     let rows: Vec<(i64, f64, f64)> = sqlx::query_as(
         "SELECT duration_s, tss, elevation_gain_m FROM activities \
-         WHERE sport_type IN ('Ride', 'VirtualRide') AND tss IS NOT NULL AND date(started_at) >= ?",
+         WHERE sport_type IN ('Ride', 'GravelRide', 'VirtualRide') AND tss IS NOT NULL AND date(started_at) >= ?",
     )
     .bind(days_ago(365))
     .fetch_all(&state.pool)
