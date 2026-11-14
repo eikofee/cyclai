@@ -447,7 +447,6 @@ fn render_calendar_html(activities: &[CalendarActivity], planned: &[CalendarPlan
     format!(
         r#"<script src="https://cdn.jsdelivr.net/npm/fullcalendar@6.1.15/index.global.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/@fullcalendar/core@6.1.15/locales/fr.global.min.js"></script>
-<p class="hint calendar-hint">Clique sur un jour pour y planifier une séance.</p>
 <div id="calendar"></div>
 <script>
 document.addEventListener('DOMContentLoaded', function() {{
@@ -1083,12 +1082,12 @@ fn render_page(
 <div class="dash-main">
 
 <section>
-<h2>Calendrier</h2>
+<h2>Calendrier</h2>{info_calendar}
 {calendar_html}
 </section>
 
 <section>
-<h2>Activités récentes</h2>
+<h2>Activités récentes</h2>{info_recent}
 <ul class="activity-list">{activity_items}</ul>
 <script>
 document.querySelectorAll('.activity-body .bilan:not(.pending)').forEach(function(p) {{
@@ -1102,7 +1101,7 @@ document.querySelectorAll('.activity-body .bilan:not(.pending)').forEach(functio
 <div class="dash-side">
 
 <section>
-<h2>4 dernières semaines</h2>
+<h2>4 dernières semaines</h2>{info_load}
 <div class="stats">
   <div class="stat"><div class="value">{tss_period:.0}</div><div class="label">{tss_label}</div></div>
   <div class="stat"><div class="value">{ctl:.1}</div><div class="label">{ctl_label}</div></div>
@@ -1116,6 +1115,9 @@ document.querySelectorAll('.activity-body .bilan:not(.pending)').forEach(functio
 
 </div>
 </div>"#,
+        info_calendar = layout::info("Cliquez sur un jour pour y planifier une séance."),
+        info_recent = layout::info("Cliquez sur le bilan d'une sortie pour l'afficher en entier."),
+        info_load = layout::info("Charge d'entraînement des 4 dernières semaines : TSS cumulé, forme (CTL), fatigue (ATL) et fraîcheur (TSB), avec la jauge de TSB et la répartition par zones."),
         load_chart_html = render_load_chart(load_chart_json),
         sync_status_js = SYNC_STATUS_JS,
         header = layout::page_header("Tableau de bord", "", actions),
@@ -1142,6 +1144,7 @@ pub(super) async fn digest_section(pool: &SqlitePool, warn: Option<&str>) -> Str
     let digest = fetch_latest_digest(pool).await.expect("digests query");
     let has_api_key = crate::settings::fetch(pool).await.map(|s| s.has_llm_key()).unwrap_or(false);
     let llm_notice_html = llm_notice(has_api_key, warn);
+    let info_digest = layout::info("Résume votre semaine à partir de vos sorties récentes et recommande une séance ; la note libre est transmise au modèle. Sans clé API, vous pouvez télécharger le rapport IA et le coller dans l'assistant de votre choix.");
     let digest_html = render_digest_section(digest.as_ref(), &config.athlete());
     // The workout saved as a template from the latest digest, if it was valid.
     let template_id: Option<i64> =
@@ -1155,7 +1158,7 @@ pub(super) async fn digest_section(pool: &SqlitePool, warn: Option<&str>) -> Str
         .unwrap_or_default();
     format!(
         r#"<section>
-<h2>Digest hebdomadaire</h2>
+<h2>Digest hebdomadaire</h2>{info_digest}
 {llm_notice_html}
 <form method="post" action="/digest">
   <label>Note libre (optionnel)
@@ -1193,7 +1196,7 @@ pub(super) fn llm_notice(has_api_key: bool, warn: Option<&str>) -> String {
         return r#"<p class="warn-banner">L'appel à l'API Anthropic a échoué (clé invalide, quota, réseau…) — voir les logs. Le rapport IA reste téléchargeable pour l'analyser dans un assistant en ligne.</p>"#.to_string();
     }
     if !has_api_key {
-        return r#"<p class="warn-banner">Aucune clé API Anthropic configurée : la génération automatique est désactivée. Renseigne-la dans <a href="/settings">Paramètres</a>, ou télécharge le rapport IA et colle-le dans Claude, ChatGPT… pour obtenir la même analyse.</p>"#.to_string();
+        return r#"<p class="warn-banner">Aucune clé API Anthropic configurée : la génération automatique est désactivée. Renseignez-la dans <a href="/settings">Paramètres</a>, ou téléchargez le rapport IA et collez-le dans Claude, ChatGPT… pour obtenir la même analyse.</p>"#.to_string();
     }
     String::new()
 }

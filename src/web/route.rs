@@ -75,14 +75,17 @@ fn render(profile: Option<(&RouteProfile, Option<&str>)>, error: Option<&str>) -
             .replace("</", "<\\/");
             let profile_html = if p.has_elevation() {
                 r#"<section>
-<h2>Profil et pente estimée</h2>
+<h2>Profil et pente estimée</h2>__INFO_GRADE__
 <div class="grade-legend" id="grade-legend"></div>
 <div class="route-chart-wrap"><canvas id="route-chart"></canvas></div>
 <label class="route-toggle"><input type="checkbox" id="show-grade-line"> Afficher aussi la courbe de pente (axe de droite)</label>
-<p class="hint">Pente estimée sur ~100 m après lissage de l'altitude (le bruit GPS ferait sinon osciller la pente) ; D+/D− calculés sur l'altitude lissée.</p>
-</section>"#
+</section>"#.replace(
+                    "__INFO_GRADE__",
+                    &super::layout::info("Pente estimée sur ~100 m après lissage de l'altitude (le bruit GPS ferait sinon osciller la pente) ; D+/D− calculés sur l'altitude lissée."),
+                )
             } else {
                 r#"<section><p class="hint">Ce fichier ne contient pas d'altitude : pas de profil ni de pente, seulement le tracé.</p></section>"#
+                .to_string()
             };
             format!(
                 r##"<section>
@@ -184,15 +187,15 @@ fn render(profile: Option<(&RouteProfile, Option<&str>)>, error: Option<&str>) -
     let body = format!(
         r#"{header}
 <section>
-<h2>Charger un itinéraire planifié</h2>
+<h2>Charger un itinéraire planifié</h2>{info_load}
 {error_html}
 <form method="post" action="/route" enctype="multipart/form-data" class="toolbar">
   <input type="file" name="file" accept=".gpx" required>
   <button type="submit">Afficher</button>
 </form>
-<p class="hint">Fichier GPX exporté d'un planificateur (trace ou itinéraire). Rien n'est enregistré.</p>
 </section>
 {result_html}"#,
+        info_load = super::layout::info("Fichier GPX exporté d'un planificateur (trace ou itinéraire). Rien n'est enregistré."),
         header = super::layout::page_header("Itinéraire", "Carte, profil d'altitude et pentes d'un GPX planifié.", ""),
     );
     let head = r#"<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" crossorigin="" />

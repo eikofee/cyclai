@@ -1,4 +1,5 @@
 use sqlx::SqlitePool;
+use std::collections::HashMap;
 
 /// Distance under which a GPS point counts as "at" a segment endpoint.
 /// Consumer cycling-computer GPS is accurate to a few meters in the open,
@@ -10,6 +11,7 @@ const MATCH_THRESHOLD_M: f64 = 15.0;
 /// for a ride passing near both ends, so they must be told apart.
 const MIN_SEGMENT_ENDS_M: f64 = 2.0 * MATCH_THRESHOLD_M;
 const MIN_SEGMENT_LENGTH_M: f64 = 100.0;
+const METERS_PER_DEG_LAT: f64 = 111_000.0;
 
 /// The segment's track as stored: streams-shaped JSON (`latlng`, `distance`,
 /// `altitude`) with a point about every 5 m, so a long segment stays small.
@@ -121,13 +123,17 @@ struct RefSegment {
 /// segment: the first point within threshold of the segment start, then the
 /// first *subsequent* point within threshold of the segment end. Returns
 /// None if the activity never passed through the segment.
+fn near(p: &[f64; 2], lat: f64, lng: f64) -> bool {
+    (p[0] - lat).abs() < MATCH_THRESHOLD_M / METERS_PER_DEG_LAT && crate::geo::haversine_m(p[0], p[1], lat, lng) < MATCH_THRESHOLD_M
+}
+
 fn match_segment(latlng: &[[f64; 2]], seg: &RefSegment) -> Option<(usize, usize)> {
     let start_idx = latlng
         .iter()
-        .position(|p| crate::geo::haversine_m(p[0], p[1], seg.start_lat, seg.start_lng) < MATCH_THRESHOLD_M)?;
+        .position(|p| near(p, seg.start_lat, seg.start_lng))?;
     let end_idx = latlng[start_idx..]
         .iter()
-        .position(|p| crate::geo::haversine_m(p[0], p[1], seg.end_lat, seg.end_lng) < MATCH_THRESHOLD_M)
+        .position(|p| near(p, seg.end_lat, seg.end_lng))
         .map(|i| start_idx + i)?;
     if end_idx > start_idx {
         Some((start_idx, end_idx))
@@ -226,10 +232,41 @@ pub fn format_delta(time_s: Option<f64>, power_w: Option<f64>) -> Option<String>
     })
 }
 
+type Bbox = (f64, f64, f64, f64);
+
+/// (min_lat, min_lng, max_lat, max_lng) of a track; `None` when it is empty.
+pub(crate) fn bbox(latlng: &[[f64; 2]]) -> Option<Bbox> {
+    let first = latlng.first()?;
+    Some(latlng.iter().fold((first[0], first[1], first[0], first[1]), |(a, b, c, d), p| {
+        (a.min(p[0]), b.min(p[1]), c.max(p[0]), d.max(p[1]))
+    }))
+}
+
+/// Whether a point within the match threshold of (lat, lng) could lie in the box.
+fn bbox_may_reach(b: Bbox, lat: f64, lng: f64) -> bool {
+    let dlat = MATCH_THRESHOLD_M / METERS_PER_DEG_LAT;
+    let dlng = dlat / lat.to_radians().cos().abs().max(0.01);
+    lat >= b.0 - dlat && lat <= b.2 + dlat && lng >= b.1 - dlng && lng <= b.3 + dlng
+}
+
+fn bbox_may_cover(b: Bbox, seg: &RefSegment) -> bool {
+    bbox_may_reach(b, seg.start_lat, seg.start_lng) && bbox_may_reach(b, seg.end_lat, seg.end_lng)
+}
+
+async fn load_streams(conn: &mut sqlx::SqliteConnection, activity_id: i64) -> anyhow::Result<serde_json::Value> {
+    let json: String = sqlx::query_scalar("SELECT streams_json FROM activity_streams WHERE activity_id = ?")
+        .bind(activity_id)
+        .fetch_one(conn)
+        .await?;
+    Ok(serde_json::from_str(&json)?)
+}
+
 /// Rebuilds `segment_efforts` from scratch, processing activities in
 /// chronological order so each effort is compared with the history that
 /// existed *before* it (a replay, not a batch aggregate). The record is the
-/// fastest earlier effort; power is optional throughout.
+/// fastest earlier effort; power is optional throughout. Streams are only
+/// parsed for rides whose bounding box (computed lazily, then stored) can
+/// reach both ends of some segment.
 pub async fn run(pool: &SqlitePool) -> anyhow::Result<()> {
     sqlx::query("DELETE FROM segment_efforts").execute(pool).await?;
 
@@ -249,9 +286,10 @@ pub async fn run(pool: &SqlitePool) -> anyhow::Result<()> {
         })
         .collect();
 
-    let activities: Vec<(i64, String)> = sqlx::query_as(
+    type ActivityRow = (i64, i64, Option<f64>, Option<f64>, Option<f64>, Option<f64>);
+    let activities: Vec<ActivityRow> = sqlx::query_as(
         r#"
-        SELECT a.id, s.streams_json
+        SELECT a.id, a.bbox_computed, a.bbox_min_lat, a.bbox_min_lng, a.bbox_max_lat, a.bbox_max_lng
         FROM activities a
         JOIN activity_streams s ON s.activity_id = a.id
         WHERE a.sport_type IN ('Ride', 'GravelRide')
@@ -261,8 +299,41 @@ pub async fn run(pool: &SqlitePool) -> anyhow::Result<()> {
     .fetch_all(pool)
     .await?;
 
-    for (activity_id, streams_json) in activities {
-        let parsed: serde_json::Value = serde_json::from_str(&streams_json)?;
+    let mut tx = pool.begin().await?;
+    let mut history: HashMap<i64, Vec<PastEffort>> = HashMap::new();
+
+    for (activity_id, computed, min_lat, min_lng, max_lat, max_lng) in activities {
+        let mut loaded: Option<serde_json::Value> = None;
+        let b = if computed == 0 {
+            let parsed = load_streams(&mut tx, activity_id).await?;
+            let b = latlng_array(&parsed).as_deref().and_then(bbox);
+            sqlx::query(
+                "UPDATE activities SET bbox_computed = 1, bbox_min_lat = ?, bbox_min_lng = ?, bbox_max_lat = ?, bbox_max_lng = ? WHERE id = ?",
+            )
+            .bind(b.map(|b| b.0))
+            .bind(b.map(|b| b.1))
+            .bind(b.map(|b| b.2))
+            .bind(b.map(|b| b.3))
+            .bind(activity_id)
+            .execute(&mut *tx)
+            .await?;
+            loaded = Some(parsed);
+            b
+        } else {
+            match (min_lat, min_lng, max_lat, max_lng) {
+                (Some(a), Some(b), Some(c), Some(d)) => Some((a, b, c, d)),
+                _ => None,
+            }
+        };
+        let Some(b) = b else { continue };
+        let candidates: Vec<&RefSegment> = ref_segments.iter().filter(|s| bbox_may_cover(b, s)).collect();
+        if candidates.is_empty() {
+            continue;
+        }
+        let parsed = match loaded {
+            Some(p) => p,
+            None => load_streams(&mut tx, activity_id).await?,
+        };
         let Some(latlng) = latlng_array(&parsed) else {
             continue;
         };
@@ -275,7 +346,7 @@ pub async fn run(pool: &SqlitePool) -> anyhow::Result<()> {
         let watts = f64_array(&parsed, "watts");
         let heartrate = f64_array(&parsed, "heartrate");
 
-        for seg in &ref_segments {
+        for seg in candidates {
             let Some((start_idx, end_idx)) = match_segment(&latlng, seg) else {
                 continue;
             };
@@ -292,33 +363,21 @@ pub async fn run(pool: &SqlitePool) -> anyhow::Result<()> {
             };
             let power = portion.avg_power_w;
 
-            let history: Vec<(i64, Option<f64>, Option<f64>, Option<f64>)> = sqlx::query_as(
-                "SELECT activity_id, avg_power_w, start_time_s, end_time_s FROM segment_efforts \
-                 WHERE reference_segment_id = ? ORDER BY id ASC",
-            )
-            .bind(seg.id)
-            .fetch_all(pool)
-            .await?;
-            let history: Vec<PastEffort> = history
-                .into_iter()
-                .filter_map(|(activity_id, power_w, start, end)| {
-                    let duration_s = end? - start?;
-                    (duration_s > 0.0).then_some(PastEffort { activity_id, duration_s, power_w })
-                })
-                .collect();
+            let past = history.entry(seg.id).or_default();
 
             // Record: the fastest earlier effort (the first one on a tie).
-            let pr = history.iter().fold(None::<&PastEffort>, |best, e| match best {
+            let pr = past.iter().fold(None::<&PastEffort>, |best, e| match best {
                 Some(b) if b.duration_s <= e.duration_s => best,
                 _ => Some(e),
             });
-            let last = history.last();
-            let recent = &history[history.len().saturating_sub(5)..];
+            let last = past.last();
+            let recent = &past[past.len().saturating_sub(5)..];
             let recent_ref = mean(&recent.iter().map(|e| e.duration_s).collect::<Vec<_>>())
                 .map(|d| (d, mean(&recent.iter().filter_map(|e| e.power_w).collect::<Vec<_>>())));
             let (pr_s, pr_w) = delta(duration_s, power, pr.map(|e| (e.duration_s, e.power_w)));
             let (recent_s, recent_w) = delta(duration_s, power, recent_ref);
             let (last_s, last_w) = delta(duration_s, power, last.map(|e| (e.duration_s, e.power_w)));
+            let (pr_id, last_id) = (pr.map(|e| e.activity_id), last.map(|e| e.activity_id));
 
             sqlx::query(
                 r#"
@@ -344,15 +403,17 @@ pub async fn run(pool: &SqlitePool) -> anyhow::Result<()> {
             .bind(last_w)
             .bind(time.get(start_idx).copied())
             .bind(time.get(end_idx).copied())
-            .bind(pr.map(|e| e.activity_id))
-            .bind(last.map(|e| e.activity_id))
+            .bind(pr_id)
+            .bind(last_id)
             .bind(distance.get(start_idx).copied())
             .bind(distance.get(end_idx).copied())
-            .execute(pool)
+            .execute(&mut *tx)
             .await?;
+            history.entry(seg.id).or_default().push(PastEffort { activity_id, duration_s, power_w: power });
         }
     }
 
+    tx.commit().await?;
     Ok(())
 }
 
@@ -435,6 +496,18 @@ mod tests {
             v["watts"] = serde_json::json!({"data": [w, w, w]});
         }
         v.to_string()
+    }
+
+    #[test]
+    fn bbox_filters_segments_a_ride_cannot_cover() {
+        let seg = RefSegment { id: 1, start_lat: 49.1000, start_lng: 6.2000, end_lat: 49.1010, end_lng: 6.2010 };
+        let through = bbox(&[[49.0990, 6.1990], [49.1020, 6.2020]]).unwrap();
+        assert!(bbox_may_cover(through, &seg));
+        let far = bbox(&[[0.0, 0.0], [0.001, 0.001]]).unwrap();
+        assert!(!bbox_may_cover(far, &seg));
+        let start_only = bbox(&[[49.0990, 6.1990], [49.1002, 6.2002]]).unwrap();
+        assert!(!bbox_may_cover(start_only, &seg));
+        assert_eq!(bbox(&[]), None);
     }
 
     #[test]

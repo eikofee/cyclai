@@ -423,7 +423,7 @@ Temps disponible pour rouler, jour par jour : une règle par défaut selon le jo
 ]}
 ```
 
-`PUT /api/v1/availability` (clé `write`) crée ou remplace l'**exception** d'un jour (`{"date": "2026-11-11", ...}`) ou d'une plage (`{"from": "...", "to": "...", ...}`, 92 jours au plus, bornes incluses), avec `available_min` (0 à 720), `time_of_day` (`soir` | `journee`), `context` (`travail` | `vacances` | `autre`) et une `note` facultative (300 caractères). Les dates vont d'aujourd'hui à plus tard (`400` sinon). Les règles par défaut ne sont modifiables que depuis l'interface, et il n'existe pas de suppression par l'API (les exceptions se suppriment dans `/settings`).
+`PUT /api/v1/availability` (clé `write`) crée ou remplace l'**exception** d'un jour (`{"date": "2026-11-11", ...}`) ou d'une plage (`{"from": "...", "to": "...", ...}`, 92 jours au plus, bornes incluses), avec `available_min` (0 à 720), `time_of_day` (`matin` | `soir` | `journee`), `context` (`travail` | `vacances` | `autre`) et une `note` facultative (300 caractères). Les dates vont d'aujourd'hui à plus tard (`400` sinon). Les règles par défaut ne sont modifiables que depuis l'interface, et il n'existe pas de suppression par l'API (les exceptions se suppriment dans `/settings`).
 
 ## GET /api/v1/ride-envelope
 

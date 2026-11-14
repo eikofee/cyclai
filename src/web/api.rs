@@ -1018,7 +1018,7 @@ pub(super) struct AvailabilityRequest {
     from: Option<String>,
     to: Option<String>,
     available_min: i64,
-    /// `soir` | `journee`
+    /// `matin` | `soir` | `journee`
     time_of_day: String,
     /// `travail` | `vacances` | `autre`
     context: String,

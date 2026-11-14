@@ -6,7 +6,7 @@ use serde::Serialize;
 use sqlx::SqlitePool;
 use std::collections::HashMap;
 
-pub const TIMES_OF_DAY: [&str; 2] = ["soir", "journee"];
+pub const TIMES_OF_DAY: [&str; 3] = ["matin", "soir", "journee"];
 pub const CONTEXTS: [&str; 3] = ["travail", "vacances", "autre"];
 pub const MAX_MINUTES: i64 = 720;
 pub const WEEKDAYS: [&str; 7] = ["Lundi", "Mardi", "Mercredi", "Jeudi", "Vendredi", "Samedi", "Dimanche"];
@@ -220,7 +220,7 @@ mod tests {
         assert!(validate(&ok).is_ok());
         assert!(validate(&Slot { available_min: -1, ..ok.clone() }).is_err());
         assert!(validate(&Slot { available_min: 721, ..ok.clone() }).is_err());
-        assert!(validate(&Slot { time_of_day: "matin".into(), ..ok.clone() }).is_err());
+        assert!(validate(&Slot { time_of_day: "nuit".into(), ..ok.clone() }).is_err());
         assert!(validate(&Slot { context: "boulot".into(), ..ok }).is_err());
     }
 }

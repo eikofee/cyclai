@@ -304,13 +304,13 @@ fn free_ride_page(p: &crate::planned::Planned, id: i64, banner: &str) -> Html<St
         "Sortie libre",
         &format!(
             r#"<a class="back-link" href="/">&larr; Retour au calendrier</a>
-<section><h2>Sortie libre du {date}</h2>{banner}
+<section><h2>Sortie libre du {date}</h2>{info_free}{banner}
 <p>Intention : <strong>{intent}</strong> · durée maximale : <strong>{duration} min</strong> · budget : <strong>{lo:.0} à {hi:.0} TSS</strong></p>
-<p class="hint">Pas de structure imposée : roule librement dans ce budget. La charge réelle remplace l'estimation quand la sortie est synchronisée depuis une source.</p>
 {notes}{activity}
 <form method="post" action="/planned/{id}/delete" onsubmit="return confirm('Retirer cette séance du calendrier ?');">
 <button type="submit" class="danger">Retirer du calendrier</button>
 </form></section>"#,
+            info_free = super::layout::info("Pas de structure imposée : roulez librement dans ce budget. La charge réelle remplace l'estimation quand la sortie est synchronisée depuis une source."),
             date = escape_html(&p.planned_date),
             intent = crate::planned::intent_label(intent),
             duration = p.budget_duration_max_min.unwrap_or(0),

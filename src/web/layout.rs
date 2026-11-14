@@ -206,15 +206,19 @@ impl<'a> Page<'a> {
     }
 }
 
-/// `<div class="page-header">` with a title, optional subtitle and actions.
-pub(super) fn page_header(title: &str, subtitle: &str, actions_html: &str) -> String {
-    let subtitle = if subtitle.is_empty() {
-        String::new()
-    } else {
-        format!(r#"<p class="subtitle">{subtitle}</p>"#)
-    };
+/// A (?) bubble to put right after a card's `<h2>`: `text` shows on hover or
+/// keyboard focus, so descriptions stay out of the way until asked for.
+pub(super) fn info(text: &str) -> String {
+    let t = super::escape_html(text);
+    format!(r#"<span class="info" tabindex="0" role="note" aria-label="{t}" data-tip="{t}">?</span>"#)
+}
+
+/// `<div class="page-header">` with a title, an optional description (shown
+/// as a (?) bubble next to the title) and actions.
+pub(super) fn page_header(title: &str, description: &str, actions_html: &str) -> String {
+    let bubble = if description.is_empty() { String::new() } else { info(description).replacen("class=\"info\"", "class=\"info inline\"", 1) };
     format!(
-        r#"<div class="page-header"><div><h1>{title}</h1>{subtitle}</div><div class="page-actions">{actions_html}</div></div>"#
+        r#"<div class="page-header"><div><h1>{title}{bubble}</h1></div><div class="page-actions">{actions_html}</div></div>"#
     )
 }
 
@@ -318,6 +322,15 @@ input[type=file]::file-selector-button { border: 1px solid var(--border-strong);
 input[type=file]::file-selector-button:hover { background: var(--bg); }
 .inline-check { display: flex; align-items: center; gap: 0.5rem; }
 .hint { color: var(--text-muted); font-size: 0.85rem; margin: 0.4rem 0 0; }
+
+/* ---- Info bubble: a (?) in the corner of a card, its text on hover/focus ---- */
+section, .card { position: relative; }
+.info { position: absolute; top: 1.2rem; right: 1.3rem; width: 1.3rem; height: 1.3rem; border-radius: 50%; border: 1px solid var(--border-strong); color: var(--text-muted); font-size: 0.75rem; font-weight: 600; display: inline-flex; align-items: center; justify-content: center; cursor: help; user-select: none; }
+.info:hover, .info:focus { color: var(--text); border-color: var(--text); outline: none; }
+.info::after { content: attr(data-tip); display: none; position: absolute; top: 1.7rem; right: 0; width: max-content; max-width: min(22rem, 80vw); padding: 0.6rem 0.8rem; border-radius: var(--radius-sm); background: var(--text); color: var(--bg); font-size: 0.8rem; font-weight: 400; line-height: 1.45; text-align: left; white-space: normal; box-shadow: var(--shadow); z-index: 10; }
+.info:hover::after, .info:focus::after { display: block; }
+.info.inline { position: relative; top: auto; right: auto; margin-left: 0.6rem; vertical-align: middle; font-size: 0.75rem; letter-spacing: 0; }
+.info.inline::after { left: 0; right: auto; }
 
 /* ---- Buttons ---- */
 button, .btn {

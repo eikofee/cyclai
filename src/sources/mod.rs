@@ -467,9 +467,17 @@ pub async fn insert(pool: &SqlitePool, a: &NewActivity) -> anyhow::Result<i64> {
     .bind(&streams_json)
     .execute(pool)
     .await?;
-    sqlx::query("UPDATE activities SET route_thumb_svg = ?, route_points_json = ? WHERE id = ?")
+    let bb = crate::segments::latlng_array(&a.streams).as_deref().and_then(crate::segments::bbox);
+    sqlx::query(
+        "UPDATE activities SET route_thumb_svg = ?, route_points_json = ?, bbox_computed = 1, \
+         bbox_min_lat = ?, bbox_min_lng = ?, bbox_max_lat = ?, bbox_max_lng = ? WHERE id = ?",
+    )
         .bind(route_thumb_svg)
         .bind(route_points)
+        .bind(bb.map(|b| b.0))
+        .bind(bb.map(|b| b.1))
+        .bind(bb.map(|b| b.2))
+        .bind(bb.map(|b| b.3))
         .bind(id)
         .execute(pool)
         .await?;

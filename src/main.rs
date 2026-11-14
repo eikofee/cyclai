@@ -13,6 +13,7 @@ mod metrics;
 mod oauth;
 mod sources;
 mod performance;
+mod power_tiers;
 mod planned;
 mod report;
 mod rules;
@@ -224,6 +225,9 @@ async fn main() -> anyhow::Result<()> {
             let background = pool.clone();
             tokio::spawn(async move {
                 sources::refresh_manifests(&background).await;
+                if let Err(err) = bests::refresh_if_stale(&background).await {
+                    tracing::error!(?err, "activity bests: refresh failed");
+                }
                 if let Err(err) = segments::refresh_if_stale(&background).await {
                     tracing::error!(?err, "segment efforts: rebuild failed");
                 }

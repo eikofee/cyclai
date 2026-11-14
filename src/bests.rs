@@ -7,8 +7,8 @@ use crate::performance::{best_average, Series};
 use serde_json::Value;
 use sqlx::SqlitePool;
 
-/// Durations (s) of the power radar — same set as `performance::power_curve`.
-pub const POWER_DURATIONS: [usize; 8] = [5, 15, 30, 60, 300, 600, 1200, 3600];
+/// Durations (s) of the power radar — the same ones Strava's power profile uses.
+pub const POWER_DURATIONS: [usize; 12] = [15, 30, 60, 120, 180, 300, 600, 900, 1200, 1800, 2700, 3600];
 /// Benchmark distances (m) for rides.
 pub const RIDE_DISTANCES: [u32; 6] = [1_000, 5_000, 10_000, 20_000, 40_000, 80_000];
 /// Benchmark distances (m) for runs.
@@ -80,6 +80,25 @@ pub async fn store(pool: &SqlitePool, activity_id: i64, is_run: bool, streams: &
     Ok(())
 }
 
+/// Rides stored when the radar had fewer durations lack the new ones: any
+/// activity with a 10-minute power best necessarily has a 2-minute one, so
+/// its absence means the bests predate the change and are recomputed.
+pub async fn refresh_if_stale(pool: &SqlitePool) -> anyhow::Result<()> {
+    let stale: Vec<(i64, String, String)> = sqlx::query_as(
+        "SELECT a.id, a.sport_type, s.streams_json FROM activities a \
+         JOIN activity_streams s ON s.activity_id = a.id \
+         WHERE EXISTS (SELECT 1 FROM activity_bests b WHERE b.activity_id = a.id AND b.kind = 'power' AND b.key = 600) \
+           AND NOT EXISTS (SELECT 1 FROM activity_bests b WHERE b.activity_id = a.id AND b.kind = 'power' AND b.key = 120)",
+    )
+    .fetch_all(pool)
+    .await?;
+    for (id, sport, streams) in stale {
+        let streams: Value = serde_json::from_str(&streams)?;
+        store(pool, id, crate::metrics::is_run(&sport), &streams).await?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -109,7 +128,7 @@ mod tests {
             "time": {"data": time}, "watts": {"data": watts}, "distance": {"data": dist},
         });
         let rows = compute(&streams, false);
-        assert!(rows.contains(&("power", 5, 300.0)));
+        assert!(rows.contains(&("power", 15, 300.0)));
         assert!(rows.iter().any(|r| r.0 == "power" && r.1 == 300));
         assert!(rows.contains(&("dist", 1000, 125.0)));
         // A run ignores power.

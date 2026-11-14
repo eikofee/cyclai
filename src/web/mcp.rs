@@ -281,7 +281,7 @@ fn tools() -> Vec<Tool> {
                     "from": date("…or a range start."),
                     "to": date("…and its end (inclusive)."),
                     "available_min": int("0-720."),
-                    "time_of_day": json!({ "type": "string", "enum": ["soir", "journee"] }),
+                    "time_of_day": json!({ "type": "string", "enum": ["matin", "soir", "journee"] }),
                     "context": json!({ "type": "string", "enum": ["travail", "vacances", "autre"] }),
                     "note": text("Max 300 chars."),
                 }),

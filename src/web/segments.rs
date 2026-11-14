@@ -45,7 +45,7 @@ pub async fn import(State(state): State<AppState>, mut multipart: axum::extract:
         }
     }
     let Some(bytes) = bytes.filter(|b| !b.is_empty()) else {
-        return Html(render(&state, None, Some("Choisis un fichier GPX.")).await).into_response();
+        return Html(render(&state, None, Some("Choisissez un fichier GPX.")).await).into_response();
     };
     // Without a name, the file's (minus its extension) is used.
     let name = if name.trim().is_empty() {
@@ -228,7 +228,7 @@ async fn render(state: &AppState, selected: Option<i64>, error: Option<&str>) ->
         .unwrap_or_default();
 
     let list_html = if segments.is_empty() {
-        r#"<p class="hint">Aucun segment. Importe le tracé d'un segment au format GPX avec le bouton ci-dessus.</p>"#
+        r#"<p class="hint">Aucun segment. Importez le tracé d'un segment au format GPX avec le bouton ci-dessus.</p>"#
             .to_string()
     } else {
         let body: String = segments
@@ -236,7 +236,7 @@ async fn render(state: &AppState, selected: Option<i64>, error: Option<&str>) ->
             .map(|s| {
                 let active = if Some(s.id) == selected { r#" class="seg-active""# } else { "" };
                 format!(
-                    r#"<tr{active}><td><a href="/segments?id={id}">{name}</a></td><td>{km:.2} km</td><td>{d:.0} m</td><td>{n}</td><td>{p}</td><td>{last}</td><td class="seg-del-cell"><form method="post" action="/segments/{id}/delete" onsubmit="return confirm('Supprimer le segment « {js_name} » et ses passages détectés ? Tes sorties ne sont pas touchées.');"><button type="submit" class="seg-del" title="Supprimer ce segment" aria-label="Supprimer ce segment">🗑</button></form></td></tr>"#,
+                    r#"<tr{active}><td><a href="/segments?id={id}">{name}</a></td><td>{km:.2} km</td><td>{d:.0} m</td><td>{n}</td><td>{p}</td><td>{last}</td><td class="seg-del-cell"><form method="post" action="/segments/{id}/delete" onsubmit="return confirm('Supprimer le segment « {js_name} » et ses passages détectés ? Vos sorties ne sont pas touchées.');"><button type="submit" class="seg-del" title="Supprimer ce segment" aria-label="Supprimer ce segment">🗑</button></form></td></tr>"#,
                     id = s.id,
                     js_name = escape_html(&s.name.replace('\\', " ").replace('\'', "’")),
                     name = escape_html(&s.name),
@@ -257,7 +257,7 @@ async fn render(state: &AppState, selected: Option<i64>, error: Option<&str>) ->
         Some(seg) => render_detail(state, seg).await,
         None if selected.is_some() => r#"<section><p class="hint">Segment introuvable.</p></section>"#.to_string(),
         None if !segments.is_empty() => {
-            r#"<section><p class="hint">Sélectionne un segment pour voir ses derniers passages, sa carte et son profil.</p></section>"#.to_string()
+            r#"<section><p class="hint">Sélectionnez un segment pour voir ses derniers passages, sa carte et son profil.</p></section>"#.to_string()
         }
         None => String::new(),
     };
@@ -271,12 +271,12 @@ async fn render(state: &AppState, selected: Option<i64>, error: Option<&str>) ->
         r#"{header}
 {error_html}
 <section>
-<h2>Segments de référence</h2>
+<h2>Segments de référence</h2>{info_segments}
 {list_html}
-<p class="hint">Un segment s'importe depuis un fichier GPX de son tracé : le premier point est le départ, le dernier l'arrivée (une boucle doit être coupée en deux). Réimporter un segment du même nom le met à jour. Les passages sont détectés par CyclAI sur tes sorties vélo avec capteur de puissance ; l'import relance la détection sur toutes les sorties et peut prendre un moment.</p>
 </section>
 {detail_html}"#,
-        header = layout::page_header("Segments", "Tes segments de référence et tes derniers passages dessus.", actions),
+        info_segments = layout::info("Un segment s'importe depuis un fichier GPX de son tracé : le premier point est le départ, le dernier l'arrivée (une boucle doit être coupée en deux). Réimporter un segment du même nom le met à jour. Les passages sont détectés par CyclAI sur vos sorties vélo avec capteur de puissance ; l'import relance la détection sur toutes les sorties et peut prendre un moment."),
+        header = layout::page_header("Segments", "Vos segments de référence et vos derniers passages dessus.", actions),
     );
 
     let head = r#"<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" crossorigin="" />

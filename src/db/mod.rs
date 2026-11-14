@@ -150,6 +150,10 @@ mod tests {
         for col in ["garmin_api_key", "source_order", "enabled_sources", "overlap_tolerance_s"] {
             sqlx::query(&format!("ALTER TABLE settings DROP COLUMN {col}")).execute(&pool).await.unwrap();
         }
+        for col in ["bbox_min_lat", "bbox_min_lng", "bbox_max_lat", "bbox_max_lng", "bbox_computed"] {
+            sqlx::query(&format!("ALTER TABLE activities DROP COLUMN {col}")).execute(&pool).await.unwrap();
+        }
+        sqlx::query("ALTER TABLE athlete_config DROP COLUMN weight_kg").execute(&pool).await.unwrap();
         sqlx::query("DROP INDEX idx_planned_idempotency").execute(&pool).await.unwrap();
         for col in ["max_ctl_ramp_per_week", "min_tsb", "intense_if", "intense_tss", "max_consecutive_intense", "min_rest_days_per_week"] {
             sqlx::query(&format!("ALTER TABLE athlete_config DROP COLUMN {col}")).execute(&pool).await.unwrap();
@@ -183,7 +187,7 @@ mod tests {
 
         migrate(&pool).await.unwrap();
         let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM _sqlx_migrations").fetch_one(&pool).await.unwrap();
-        assert_eq!(n, 15); // initial (adopted) + the fourteen later migrations (applied after)
+        assert_eq!(n, 17); // initial (adopted) + the sixteen later migrations (applied after)
         migrate(&pool).await.unwrap(); // idempotent
     }
 

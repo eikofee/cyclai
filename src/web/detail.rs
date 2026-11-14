@@ -1252,9 +1252,10 @@ pub async fn activity_detail(
     let power_zone_section = if activity.zone_secs.iter().sum::<i64>() > 0 {
         format!(
             "<section>
-<h2>Répartition zones de puissance</h2>
+<h2>Répartition zones de puissance</h2>{}
 {}
 </section>",
+            super::layout::info("Temps passé dans chaque zone de puissance, calculées à partir de votre FTP actuelle (réglages)."),
             render_zone_bar(&activity.zone_secs, ftp_watts as f64)
         )
     } else {
@@ -1346,11 +1347,12 @@ pub async fn activity_detail(
         power_zone_secs_total_json = power_zone_secs_total_json,
         hr_zone_secs_total_json = hr_zone_secs_total_json,
         hr_zone_section = hr_zone_html
-            .map(|h| format!("<section><h2>Répartition zones cardiaques</h2>{h}</section>"))
+            .map(|h| format!("<section><h2>Répartition zones cardiaques</h2>{}{h}</section>", super::layout::info("Temps passé dans chaque zone de fréquence cardiaque, calculées à partir de votre FC max et de votre FC repos (réglages).")))
             .unwrap_or_default(),
         power_curve_section = power_curve_chart
             .map(|chart| format!(
-                "<section><h2>Courbe de puissance</h2><div class=\"chart-block\">{chart}</div><div class=\"pc-row\">{}</div></section>",
+                "<section><h2>Courbe de puissance</h2>{}<div class=\"chart-block\">{chart}</div><div class=\"pc-row\">{}</div></section>",
+                super::layout::info("Votre meilleure puissance moyenne sur cette sortie pour chaque durée."),
                 power_curve_cells.unwrap_or_default()
             ))
             .unwrap_or_default(),

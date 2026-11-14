@@ -238,15 +238,74 @@ pub async fn page(State(state): State<AppState>, Query(q): Query<StatsQuery>) ->
     // ---- radar --------------------------------------------------------
     let duration_label = |s: usize| if s < 60 { format!("{s} s") } else { format!("{} min", s / 60) };
     let radar_labels: Vec<String> = POWER_DURATIONS.iter().map(|d| duration_label(*d)).collect();
-    let series = |m: &BTreeMap<i64, Best>| -> Vec<serde_json::Value> {
-        POWER_DURATIONS.iter().map(|d| m.get(&(*d as i64)).map_or(serde_json::Value::Null, |b| json!(b.value.round()))).collect()
+    // With a weight set, the radar is graduated in tiers (Strava-style, W/kg);
+    // otherwise it stays in raw watts.
+    let weight_kg: f64 = sqlx::query_scalar("SELECT weight_kg FROM athlete_config WHERE id = 1").fetch_one(&state.pool).await.unwrap_or(0.0);
+    let tiered = weight_kg > 0.0;
+    let series = |m: &BTreeMap<i64, Best>, tier: bool| -> Vec<serde_json::Value> {
+        POWER_DURATIONS
+            .iter()
+            .map(|d| {
+                m.get(&(*d as i64)).map_or(serde_json::Value::Null, |b| {
+                    if tier { json!((crate::power_tiers::score(*d, b.value, weight_kg) * 100.0).round() / 100.0) } else { json!(b.value.round()) }
+                })
+            })
+            .collect()
     };
     let has_power = !power_all.is_empty();
-    let power_chips: String = POWER_DURATIONS
-        .iter()
-        .filter_map(|d| power_all.get(&(*d as i64)).map(|b| (*d, b)))
-        .map(|(d, b)| format!(r#"<span class="chip" title="{}">{} <strong>{:.0} W</strong></span>"#, escape_html(&format_datetime_fr(&b.started_at)), duration_label(d), b.value))
-        .collect();
+    // Compact list under the radar: one row per duration, grouped like Strava
+    // (sprint up to 1 min, attack up to 10 min, the rest "dénivelé"), each
+    // value linking to the activity that holds it.
+    let short_date = |rfc3339: &str| {
+        chrono::DateTime::parse_from_rfc3339(rfc3339)
+            .map(|d| d.with_timezone(&chrono_tz::Europe::Paris).format("%d/%m/%Y").to_string())
+            .unwrap_or_default()
+    };
+    let power_cell = |d: usize, b: Option<&Best>| -> String {
+        let Some(b) = b else { return r#"<span class="pw-cell muted">–</span>"#.to_string() };
+        let (wkg, tier) = if tiered {
+            let score = crate::power_tiers::score(d, b.value, weight_kg);
+            (format!(r#" <small>{:.1} W/kg</small>"#, b.value / weight_kg), format!(r#" title="{}""#, crate::power_tiers::tier_name(score)))
+        } else {
+            (String::new(), String::new())
+        };
+        format!(
+            r#"<span class="pw-cell"{tier}><strong>{:.0} W</strong>{wkg} <a href="/activity/{}">{}</a></span>"#,
+            b.value,
+            b.activity_id,
+            escape_html(&short_date(&b.started_at))
+        )
+    };
+    let group_rows = |keep: &dyn Fn(usize) -> bool| -> String {
+        POWER_DURATIONS
+            .iter()
+            .filter(|d| keep(**d) && power_all.contains_key(&(**d as i64)))
+            .map(|d| {
+                let period_cell = if show_period { power_cell(*d, power_period.get(&(*d as i64))) } else { String::new() };
+                format!(
+                    r#"<div class="pw-row"><span class="pw-d">{}</span>{}{period_cell}</div>"#,
+                    duration_label(*d),
+                    power_cell(*d, power_all.get(&(*d as i64)))
+                )
+            })
+            .collect()
+    };
+    let period_head = if show_period {
+        r#"<div class="pw-head"><span></span><span><span class="legend-dot" style="background:var(--accent)"></span>Record</span><span><span class="legend-dot" style="background:#f97316"></span>Sur la période</span></div>"#
+    } else {
+        ""
+    };
+    // Two columns: sprint + attack on the left, the long efforts on the right.
+    let group = |title: &str, rows: String| if rows.is_empty() { String::new() } else { format!(r#"<div class="pw-group"><h3>{title}</h3>{rows}</div>"#) };
+    let left = group("Sprint", group_rows(&|d| d <= 60)) + &group("Attaque", group_rows(&|d| d > 60 && d <= 600));
+    let right = group("Dénivelé", group_rows(&|d| d > 600));
+    let column = |groups: String| if groups.is_empty() { String::new() } else { format!(r#"<div class="pw-col">{period_head}{groups}</div>"#) };
+    let power_chips = format!(r#"<div class="pw-list">{}{}</div>"#, column(left), column(right));
+    let tier_hint = if tiered {
+        String::new()
+    } else {
+        r#"<p class="hint">Renseignez votre poids dans les réglages pour classer ces records par paliers (en W/kg), comme Strava.</p>"#.to_string()
+    };
 
     // ---- map + chart data ---------------------------------------------
     let routes: Vec<serde_json::Value> = in_period
@@ -270,9 +329,14 @@ pub async fn page(State(state): State<AppState>, Query(q): Query<StatsQuery>) ->
         },
         "radar": {
             "labels": radar_labels,
-            "all": series(&power_all),
-            "period": series(&power_period),
+            "all": series(&power_all, tiered),
+            "period": series(&power_period, tiered),
+            "allW": series(&power_all, false),
+            "periodW": series(&power_period, false),
             "hasPeriod": show_period,
+            "tiered": tiered,
+            "weight": weight_kg,
+            "tiers": crate::power_tiers::TIER_NAMES,
         },
     })
     .to_string()
@@ -285,11 +349,12 @@ pub async fn page(State(state): State<AppState>, Query(q): Query<StatsQuery>) ->
     let map_section = if routes.is_empty() {
         r#"<p class="hint">Aucune trace GPS sur cette période.</p>"#.to_string()
     } else {
-        format!(r#"<p class="hint">{} traces — survole pour mettre en avant, clique pour ouvrir la sortie. <span class="legend-dot" style="background:var(--accent)"></span> vélo <span class="legend-dot" style="background:#0d9488"></span> course</p><div id="stats-map" class="stats-map"></div>"#, routes.len())
+        format!(r#"<p class="hint">{} traces. <span class="legend-dot" style="background:var(--accent)"></span> vélo <span class="legend-dot" style="background:#0d9488"></span> course</p><div id="stats-map" class="stats-map"></div>"#, routes.len())
     };
+    let info_radar = layout::info("Votre meilleure puissance moyenne sur chaque durée, de 15 secondes à 1 heure. Une fois votre poids renseigné dans les réglages, les anneaux sont les paliers en W/kg (En herbe à Classe mondiale) ; le palier s'affiche au survol.");
     let radar_section = if has_power {
         format!(
-            r#"<section><h2>⚡ Puissance maximale par durée</h2><div class="radar-wrap"><canvas id="radar-chart"></canvas></div><div class="chip-row">{power_chips}</div></section>"#
+            r#"<section><h2>⚡ Puissance maximale par durée</h2>{info_radar}<div class="radar-wrap"><canvas id="radar-chart"></canvas></div>{power_chips}{tier_hint}</section>"#
         )
     } else {
         String::new()
@@ -299,16 +364,20 @@ pub async fn page(State(state): State<AppState>, Query(q): Query<StatsQuery>) ->
         r#"{header}
 <div class="stats">{tiles}</div>
 <div class="stats-grid">
-<section><h2>Distance par mois</h2><div class="months-wrap"><canvas id="months-chart"></canvas></div></section>
-<section><h2>Faits marquants</h2><ul class="highlights">{highlights}</ul></section>
+<section><h2>Distance par mois</h2>{info_months}<div class="months-wrap"><canvas id="months-chart"></canvas></div></section>
+<section><h2>Faits marquants</h2>{info_highlights}<ul class="highlights">{highlights}</ul></section>
 </div>
-<section><h2>🗺 Toutes les traces</h2>{map_section}</section>
+<section><h2>🗺 Toutes les traces</h2>{info_map}{map_section}</section>
 <div class="stats-grid">
 {radar_section}
-<section><h2>🏁 Records sur distance</h2>{records_html}</section>
+<section><h2>🏁 Records sur distance</h2>{info_records}{records_html}</section>
 </div>
 <script>{script}</script>"#,
-        header = layout::page_header("Statistiques", "Distance, traces et records de toutes tes sorties.", &format!(r#"<div class="period-tabs">{tabs}</div>"#)),
+        info_months = layout::info("Kilomètres roulés à vélo et courus à pied, mois par mois, sur la période choisie."),
+        info_highlights = layout::info("Vos plus longues sorties et votre plus gros dénivelé sur la période choisie."),
+        info_map = layout::info("Survolez une trace pour la mettre en avant, cliquez dessus pour ouvrir la sortie."),
+        info_records = layout::info("Votre meilleur temps sur des distances de référence, affiché en vitesse moyenne (vélo) ou en allure (course), sur la période choisie et sur tout l'historique."),
+        header = layout::page_header("Statistiques", "Distance, traces et records de toutes vos sorties.", &format!(r#"<div class="period-tabs">{tabs}</div>"#)),
         script = STATS_JS.replace("__DATA__", &data),
     );
 
@@ -328,7 +397,15 @@ const STATS_CSS: &str = r#"
 .stats-map { height: 520px; border-radius: var(--radius-sm); }
 .months-wrap { height: 260px; }
 .radar-wrap { height: 340px; }
-.chip-row { display: flex; flex-wrap: wrap; gap: 0.4rem; margin-top: 0.8rem; }
+.pw-list { margin-top: 0.8rem; font-size: 0.85rem; display: grid; grid-template-columns: repeat(auto-fit, minmax(15rem, 1fr)); gap: 0 1.6rem; align-items: start; }
+.pw-group h3 { font-size: 0.72rem; text-transform: uppercase; letter-spacing: 0.08em; color: var(--text-muted); margin: 0.8rem 0 0.2rem; }
+.pw-row, .pw-head { display: grid; grid-template-columns: 3.2rem 1fr; gap: 0.2rem 0.8rem; padding: 0.25rem 0; border-bottom: 1px solid var(--border); align-items: baseline; }
+.pw-col:has(.pw-head) .pw-row, .pw-head { grid-template-columns: 3.5rem 1fr 1fr; }
+.pw-head { color: var(--text-muted); font-size: 0.75rem; border-bottom: 0; }
+.pw-d { color: var(--text-muted); font-weight: 500; }
+.pw-cell small { color: var(--text-muted); margin-left: 0.2rem; }
+.pw-cell a { margin-left: 0.4rem; font-size: 0.8rem; color: var(--text-muted); }
+.pw-cell a:hover { color: var(--accent); }
 .highlights { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 0.6rem; }
 .highlights li { display: grid; grid-template-columns: 1fr auto; gap: 0.1rem 0.8rem; padding: 0.6rem 0.8rem; background: var(--bg); border-radius: var(--radius-sm); }
 .highlights li span { color: var(--text-muted); font-size: 0.85rem; grid-column: 1 / -1; }
@@ -379,14 +456,24 @@ const STATS_JS: &str = r##"
   if (radarEl) {
     var datasets = [{ label: D.radar.hasPeriod ? 'Record' : 'Record (W)', data: D.radar.all, borderColor: accent, backgroundColor: accent + '33', pointBackgroundColor: accent, spanGaps: true }];
     if (D.radar.hasPeriod) datasets.push({ label: 'Sur la période', data: D.radar.period, borderColor: '#f97316', backgroundColor: '#f9731633', pointBackgroundColor: '#f97316', spanGaps: true });
+    var R = D.radar, tiered = R.tiered;
+    var rScale = { beginAtZero: true, grid: { color: grid }, angleLines: { color: grid }, pointLabels: { color: muted, font: { size: 12 } },
+                   ticks: { backdropColor: 'transparent', color: muted, callback: function(v) { return v + ' W'; } } };
+    if (tiered) {
+      // One ring per tier boundary; the tier is named in the tooltip only.
+      rScale.min = 0; rScale.max = 8; rScale.ticks.stepSize = 1; rScale.ticks.display = false;
+    }
     new Chart(radarEl, {
       type: 'radar',
-      data: { labels: D.radar.labels, datasets: datasets },
+      data: { labels: R.labels, datasets: datasets },
       options: { responsive: true, maintainAspectRatio: false,
-        scales: { r: { beginAtZero: true, grid: { color: grid }, angleLines: { color: grid }, pointLabels: { color: muted, font: { size: 12 } },
-                       ticks: { backdropColor: 'transparent', color: muted, callback: function(v) { return v + ' W'; } } } },
-        plugins: { legend: { display: D.radar.hasPeriod, position: 'bottom' },
-                   tooltip: { callbacks: { label: function(c) { return c.dataset.label + ' : ' + c.parsed.r + ' W'; } } } } }
+        scales: { r: rScale },
+        plugins: { legend: { display: false },
+                   tooltip: { callbacks: { label: function(c) {
+                     if (!tiered) return c.dataset.label + ' : ' + c.parsed.r + ' W';
+                     var w = (c.datasetIndex === 0 ? R.allW : R.periodW)[c.dataIndex];
+                     return c.dataset.label + ' : ' + w + ' W · ' + (w / R.weight).toFixed(1) + ' W/kg · ' + R.tiers[Math.min(7, Math.floor(c.parsed.r))];
+                   } } } } }
     });
   }
 })();

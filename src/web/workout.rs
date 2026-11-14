@@ -518,10 +518,10 @@ async fn render_readonly(id: i64, pool: &SqlitePool, ath: &Athlete) -> String {
 </form>
 </section>
 <section>
-<h2>Exporter</h2>
+<h2>Exporter</h2>{info_export}
 {exports}
-<p class="hint">Le format .fit n'a pas de rampe : chaque rampe devient une plage de puissance cible (du point bas au point haut). En « % FTP », la montre applique sa propre FTP ; en « watts », la FTP de l'application.</p>
 </section>"#,
+            info_export = super::layout::info("Le format .fit n'a pas de rampe : chaque rampe devient une plage de puissance cible (du point bas au point haut). En « % FTP », la montre applique sa propre FTP ; en « watts », la FTP de l'application."),
             name = escape_html(&name),
             ftp = ath.ftp_watts.round(),
             chart = chart_div(&steps_json, ath),
@@ -951,7 +951,7 @@ const BUILDER_SCRIPT: &str = r####"<script>
 
   function renderRows() {
     builderEl.innerHTML = stepsHtml(workout.steps, '') ||
-      '<p class="hint">Aucune étape — ajoute-en une ci-dessous.</p>';
+      '<p class="hint">Aucune étape — ajoutez-en une ci-dessous.</p>';
     topAddEl.innerHTML = addButtonsHtml('');
     refresh();
   }

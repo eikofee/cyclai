@@ -41,6 +41,25 @@ input.color-input { width: 36px; height: 36px; padding: 2px; margin: 0; cursor: 
 .source-row .grow { flex: 1; min-width: 10rem; }
 .source-row label { display: inline-flex; align-items: center; gap: 0.4rem; margin: 0; }
 .source-row button { padding: 0.15rem 0.55rem; margin: 0; }
+.avail-row { display: grid; grid-template-columns: 6.5rem auto auto minmax(0, 1fr); gap: 0.4rem 1.2rem; align-items: center; padding: 0.55rem 0; border-bottom: 1px solid var(--border); }
+.avail-row:last-of-type { border-bottom: 0; }
+.avail-day { font-weight: 600; }
+.avail-ctl { display: flex; flex-wrap: wrap; align-items: center; gap: 0.5rem 1.2rem; }
+.avail-row .avail-ctl { display: contents; }
+.avail-dur { display: inline-flex; align-items: center; gap: 0.35rem; color: var(--text-muted); font-size: 0.85rem; }
+.avail-dur input { width: 4.2rem; margin: 0; }
+label.avail-free { display: inline-flex; align-items: center; gap: 0.45rem; margin: 0; white-space: nowrap; color: var(--text); }
+.avail-tod select { margin: 0; }
+.avail-exc { display: flex; justify-content: space-between; align-items: center; gap: 0.8rem; padding: 0.4rem 0; border-bottom: 1px solid var(--border); font-size: 0.9rem; }
+.avail-exc button { margin: 0; padding: 0.15rem 0.6rem; }
+@media (max-width: 640px) { .avail-row { grid-template-columns: 1fr 1fr; } .avail-day { grid-column: 1 / -1; } }
+.field { display: grid; grid-template-columns: minmax(0, 17rem) minmax(0, 1fr); gap: 0.2rem 1.2rem; align-items: start; margin: 0 0 0.9rem; }
+.field > label { margin: 0; padding-top: 0.55rem; }
+.field .control input, .field .control select { margin-top: 0; }
+.field .control input[type=number], .field .control input[type=date], .field .control input.short { max-width: 12rem; }
+.field .control .hint { margin: 0.35rem 0 0; font-size: 0.8rem; }
+.field .swatches { margin: 0.2rem 0 0; }
+@media (max-width: 640px) { .field { grid-template-columns: minmax(0, 1fr); } .field > label { padding-top: 0; } }
 .badge { font-size: 0.72rem; padding: 0.1rem 0.5rem; border-radius: 999px; border: 1px solid var(--border-strong); color: var(--text-muted); }")
         .render()
 }
@@ -60,6 +79,8 @@ async fn render_page(pool: &sqlx::SqlitePool, error: Option<&str>) -> Html<Strin
     .fetch_one(pool)
     .await
     .unwrap_or((0, 0, 0, 0, 1.0, 0));
+    let weight_kg: f64 = sqlx::query_scalar("SELECT weight_kg FROM athlete_config WHERE id = 1").fetch_one(pool).await.unwrap_or(0.0);
+    let weight = if weight_kg > 0.0 { format!("{weight_kg}") } else { String::new() };
     let run_pace = if run_pace_s > 0 { super::format::format_pace_secs(run_pace_s as f64) } else { String::new() };
 
     let error_html = error
@@ -72,15 +93,10 @@ async fn render_page(pool: &sqlx::SqlitePool, error: Option<&str>) -> Html<Strin
         .enumerate()
         .map(|(i, s)| {
             format!(
-                r#"  <div class="avail-row"><strong>{day}</strong>
-    <input type="number" name="min_{i}" value="{min}" min="0" max="720" aria-label="Minutes {day}"> min
-    <select name="tod_{i}">{tod}</select>
-    <select name="ctx_{i}">{ctx}</select></div>
+                r#"  <div class="avail-row"><strong class="avail-day">{day}</strong>{ctl}</div>
 "#,
                 day = crate::availability::WEEKDAYS[i],
-                min = s.available_min,
-                tod = select_options(&crate::availability::TIMES_OF_DAY, &s.time_of_day),
-                ctx = select_options(&crate::availability::CONTEXTS, &s.context),
+                ctl = avail_inputs(&i.to_string(), s.available_min, &s.time_of_day),
             )
         })
         .collect();
@@ -92,12 +108,15 @@ async fn render_page(pool: &sqlx::SqlitePool, error: Option<&str>) -> Html<Strin
         exceptions
             .iter()
             .map(|(date, s, note)| {
+                let slot = match s.time_of_day.as_str() {
+                    "journee" => "journée libre",
+                    "matin" => "matin seulement",
+                    _ => "soir seulement",
+                };
                 format!(
-                    r#"<form method="post" action="/settings/availability/delete" class="avail-row">{date} : {min} min, {tod}, {ctx}{note} <input type="hidden" name="date" value="{date}"><button type="submit" class="secondary">Supprimer</button></form>"#,
+                    r#"<form method="post" action="/settings/availability/delete" class="avail-exc"><span><strong>{date}</strong> : {dur}, {slot}{note}</span><input type="hidden" name="date" value="{date}"><button type="submit" class="secondary">Supprimer</button></form>"#,
                     date = escape_html(date),
-                    min = s.available_min,
-                    tod = escape_html(&s.time_of_day),
-                    ctx = escape_html(&s.context),
+                    dur = format_hm(s.available_min),
                     note = note.as_deref().map(|n| format!(" — {}", escape_html(n))).unwrap_or_default(),
                 )
             })
@@ -134,13 +153,109 @@ async fn render_page(pool: &sqlx::SqlitePool, error: Option<&str>) -> Html<Strin
         ));
     }
     let no_plugins = if source_cfg.order.is_empty() {
-        r#"<p class="hint">Aucun plugin n'est déclaré. Un plugin est un petit service (un conteneur de plus) qui apporte les activités d'une source comme Garmin Connect : ajoute-le à ton <code>docker-compose.yml</code>, puis déclare-le pour CyclAI avec deux variables d'environnement, par exemple :</p>
+        r#"<p class="hint">Aucun plugin n'est déclaré. Un plugin est un petit service (un conteneur de plus) qui apporte les activités d'une source comme Garmin Connect : ajoutez-le à votre <code>docker-compose.yml</code>, puis déclarez-le pour CyclAI avec deux variables d'environnement, par exemple :</p>
 <pre class="hint">CYCLAI_PLUGINS=garmin=http://garmin:8080
 CYCLAI_PLUGIN_GARMIN_SECRET=une-longue-phrase-secrete-partagee</pre>
 <p class="hint">Les identifiants de la source (clé API, etc.) se renseignent dans le conteneur du plugin, pas ici. Voir docs/PLUGINS.md.</p>"#
     } else {
         ""
     };
+
+    let info = super::layout::info;
+    let num = |id: &str, value: &dyn std::fmt::Display, attrs: &str| format!(r#"<input type="number" id="{id}" name="{id}" value="{value}" {attrs}>"#);
+
+    let athlete_fields = [
+        field("ftp_watts", &format!("{} (W)", super::annotate_acronyms("FTP")), &num("ftp_watts", &ftp_watts, r#"min="1""#), ""),
+        field("hr_max", "FC max (bpm)", &num("hr_max", &hr_max, r#"min="1""#), ""),
+        field("hr_rest", "FC repos (bpm)", &num("hr_rest", &hr_rest, r#"min="1""#), ""),
+        field(
+            "lthr",
+            "FC seuil / LTHR (bpm)",
+            &num("lthr", &lthr, r#"min="0""#),
+            "Référence du hrTSS (une heure à la FC seuil = 100). 0 : automatique, FC repos + 85 % de la réserve cardiaque.",
+        ),
+        field(
+            "weight_kg",
+            "Poids (kg)",
+            &num("weight_kg", &weight, r#"min="30" max="250" step="0.1" placeholder="non renseigné""#),
+            "Sert à classer votre puissance maximale par paliers en W/kg (comme Strava) sur la page Statistiques.",
+        ),
+        field(
+            "run_pace",
+            "Allure seuil en course à pied (min/km)",
+            &format!(r#"<input type="text" class="short" id="run_pace" name="run_pace" value="{run_pace}" placeholder="4:30" pattern="[0-9]+:[0-5][0-9]">"#),
+            "Référence des cibles d'allure du concepteur de séances : place une étape d'allure sur l'échelle d'intensité (graphique, TSS et distance estimés). Vide : non réglée.",
+        ),
+        field(
+            "hr_tss_coef",
+            "Coefficient hrTSS dans la charge totale",
+            &num("hr_tss_coef", &hr_tss_coef, r#"min="0" max="10" step="0.05""#),
+            "Multiplie le hrTSS des courses quand il s'additionne au TSS puissance du vélo dans CTL/ATL/TSB et les totaux (1 = compte comme un TSS vélo, 0,8 = 20 % de moins, 0 = les courses ne comptent pas). Le hrTSS affiché sur chaque course reste le score brut.",
+        ),
+    ]
+    .concat();
+
+    let rules_fields = [
+        field("max_ctl_ramp_per_week", "Gain de CTL maximal sur 7 jours", &num("max_ctl_ramp_per_week", &rules.max_ctl_ramp_per_week, r#"min="0" step="0.5""#), ""),
+        field("min_tsb", "Plancher de TSB", &num("min_tsb", &rules.min_tsb, r#"min="-100" max="0" step="1""#), ""),
+        field("intense_if", "Jour intense : IF à partir de", &num("intense_if", &rules.intense_if, r#"min="0.5" max="1.5" step="0.01""#), ""),
+        field("intense_tss", "Jour intense : TSS du jour à partir de", &num("intense_tss", &rules.intense_tss, r#"min="1" step="1""#), ""),
+        field("max_consecutive_intense", "Jours intenses consécutifs maximum", &num("max_consecutive_intense", &rules.max_consecutive_intense, r#"min="1" max="7""#), ""),
+        field("min_rest_days_per_week", "Jours de repos minimum par fenêtre de 7 jours", &num("min_rest_days_per_week", &rules.min_rest_days_per_week, r#"min="0" max="7""#), ""),
+    ]
+    .concat();
+
+    let exception_fields = [
+        field("exc_date", "Date", r#"<input type="date" id="exc_date" name="date" required>"#, ""),
+        field("h_exc", "Disponibilité", &avail_inputs("exc", 2 * 60, "soir"), "Durée disponible ce jour-là. « Journée libre » : vous pouvez rouler en journée comme le soir ; sinon, seulement le matin ou seulement le soir."),
+        field("exc_note", "Note", r#"<input type="text" id="exc_note" name="note" maxlength="300">"#, ""),
+    ]
+    .concat();
+
+    let appearance_fields = [
+        field(
+            "theme_color",
+            "Couleur du thème",
+            &format!(
+                r#"<div class="swatches">{swatches}<span class="swatch-custom"><input type="color" id="theme_color" name="theme_color" value="{color}" class="color-input" title="Couleur personnalisée"><span class="hint">personnalisée</span></span></div>"#,
+                swatches = THEME_PRESETS
+                    .iter()
+                    .map(|(name, hex)| format!(
+                        r#"<button type="button" class="swatch{}" data-color="{hex}" style="background:{hex}" title="{name}" aria-label="{name}"></button>"#,
+                        if hex.eq_ignore_ascii_case(&settings.theme_color) { " selected" } else { "" }
+                    ))
+                    .collect::<String>(),
+                color = escape_html(&settings.theme_color),
+            ),
+            "",
+        ),
+        field(
+            "theme_mode",
+            "Mode",
+            &format!(
+                r#"<select id="theme_mode" name="theme_mode">{}</select>"#,
+                super::layout::MODES
+                    .iter()
+                    .map(|(v, l)| format!(r#"<option value="{v}"{}>{l}</option>"#, if *v == settings.theme_mode { " selected" } else { "" }))
+                    .collect::<String>()
+            ),
+            "",
+        ),
+    ]
+    .concat();
+
+    let overlap_field = field(
+        "overlap_tolerance_s",
+        "Chevauchement toléré entre deux activités (secondes)",
+        &num("overlap_tolerance_s", &source_cfg.tolerance_s, r#"min="0" max="3600" step="1""#),
+        "Deux activités ne sont considérées comme superposées que si elles partagent plus de ce nombre de secondes (une sortie qui enchaîne directement sur la suivante ne compte pas).",
+    );
+    let api_key_field = field(
+        "anthropic_api_key",
+        "Clé API",
+        &format!(r#"<input type="password" autocomplete="off" id="anthropic_api_key" name="anthropic_api_key" value="{}">"#, escape_html(&settings.anthropic_api_key)),
+        "",
+    );
 
     let body = format!(
         r##"{error_html}
@@ -151,13 +266,9 @@ CYCLAI_PLUGIN_GARMIN_SECRET=une-longue-phrase-secrete-partagee</pre>
 <div class="settings-group" id="general">
 <div class="group-title" role="heading" aria-level="2">Général</div>
 <section>
-<h2>Apparence</h2>
+<h2>Apparence</h2>{info_appearance}
 <form method="post" action="/settings/appearance">
-  <label>Couleur du thème</label>
-  <div class="swatches">{swatches}<span class="swatch-custom"><input type="color" name="theme_color" value="{theme_color}" class="color-input" title="Couleur personnalisée"><span class="hint">personnalisée</span></span></div>
-  <label>Mode
-  <select name="theme_mode">{theme_modes}</select>
-  </label>
+  {appearance_fields}
   <script>
 document.querySelectorAll('.swatch').forEach(function(b) {{
   b.addEventListener('click', function() {{
@@ -166,7 +277,6 @@ document.querySelectorAll('.swatch').forEach(function(b) {{
   }});
 }});
 </script>
-  <p class="hint">La couleur d'accent colore la navigation, les boutons et les liens ; les couleurs des zones et des courbes (puissance, FC…) restent fixes pour rester lisibles d'un écran à l'autre.</p>
   <button type="submit">Enregistrer</button>
   <button type="submit" name="reset" value="1" class="secondary">Réinitialiser</button>
 </form>
@@ -177,85 +287,39 @@ document.querySelectorAll('.swatch').forEach(function(b) {{
 <div class="settings-group" id="entrainement">
 <div class="group-title" role="heading" aria-level="2">Entraînement</div>
 <section>
-<h2>Profil physiologique</h2>
-<p class="hint">FTP recalcule rétroactivement TSS/IF/zones de tout l'historique une fois enregistrée. Les FC (max, repos, seuil) recalculent le hrTSS des courses à pied.</p>
+<h2>Profil physiologique</h2>{info_profile}
 <form method="post" action="/settings/athlete">
-  <label>{ftp_label} (W)
-  <input type="number" name="ftp_watts" value="{ftp_watts}" min="1">
-  </label>
-  <label>FC max (bpm)
-  <input type="number" name="hr_max" value="{hr_max}" min="1">
-  </label>
-  <label>FC repos (bpm)
-  <input type="number" name="hr_rest" value="{hr_rest}" min="1">
-  </label>
-  <label>FC seuil / LTHR (bpm, 0 = automatique)
-  <input type="number" name="lthr" value="{lthr}" min="0">
-  </label>
-  <label>Coefficient hrTSS dans la charge totale
-  <input type="number" name="hr_tss_coef" value="{hr_tss_coef}" min="0" max="10" step="0.05">
-  </label>
-  <p class="hint">Multiplie le hrTSS des courses quand il s'additionne au TSS puissance du vélo dans CTL/ATL/TSB et les totaux (1 = compte comme un TSS vélo, 0,8 = 20 % de moins, 0 = les courses ne comptent pas). Le hrTSS affiché sur chaque course reste le score brut.</p>
-  <label>Allure seuil en course à pied (min/km, vide = non réglée)
-  <input type="text" name="run_pace" value="{run_pace}" placeholder="4:30" pattern="[0-9]+:[0-5][0-9]">
-  </label>
-  <p class="hint">Référence des cibles d'allure du concepteur de séances : sert à placer une étape d'allure sur l'échelle d'intensité (graphique, TSS et distance estimés).</p>
-  <p class="hint">Sert de référence au hrTSS (une heure à la FC seuil = 100). Automatique : FC repos + 85 % de la réserve cardiaque.</p>
+  {athlete_fields}
   <button type="submit">Enregistrer</button>
 </form>
 </section>
 
 <section>
-<h2>Règles d'entraînement</h2>
-<p class="hint">Appliquées par le serveur aux séances proposées et aux simulations de charge (l'agent ne peut pas les contourner). Un jour est « intense » si son IF atteint le seuil ou si son TSS atteint le TSS minimum.</p>
+<h2>Règles d'entraînement</h2>{info_rules}
 <form method="post" action="/settings/rules">
-  <label>Gain de CTL maximal sur 7 jours
-  <input type="number" name="max_ctl_ramp_per_week" value="{max_ctl_ramp}" min="0" step="0.5">
-  </label>
-  <label>Plancher de TSB
-  <input type="number" name="min_tsb" value="{min_tsb}" min="-100" max="0" step="1">
-  </label>
-  <label>Jour intense : IF à partir de
-  <input type="number" name="intense_if" value="{intense_if}" min="0.5" max="1.5" step="0.01">
-  </label>
-  <label>Jour intense : TSS du jour à partir de
-  <input type="number" name="intense_tss" value="{intense_tss}" min="1" step="1">
-  </label>
-  <label>Jours intenses consécutifs maximum
-  <input type="number" name="max_consecutive_intense" value="{max_consec}" min="1" max="7">
-  </label>
-  <label>Jours de repos minimum par fenêtre de 7 jours
-  <input type="number" name="min_rest_days_per_week" value="{min_rest}" min="0" max="7">
-  </label>
+  {rules_fields}
   <button type="submit">Enregistrer</button>
 </form>
 </section>
 
 <section>
-<h2>Disponibilités</h2>
-<p class="hint">Temps disponible pour rouler, par jour de la semaine. L'agent s'en sert pour dimensionner les séances ; il peut poser des exceptions (vacances, soirées longues), jamais modifier ces règles.</p>
+<h2>Disponibilités</h2>{info_availability}
 <form method="post" action="/settings/availability">
 {availability_rows}
   <button type="submit">Enregistrer</button>
 </form>
+<script>
+document.querySelectorAll('.avail-free input').forEach(function(c) {{
+  var tod = c.closest('.avail-ctl').querySelector('.avail-tod');
+  function sync() {{ tod.hidden = c.checked; tod.querySelector('select').disabled = c.checked; }}
+  c.addEventListener('change', sync);
+  sync();
+}});
+</script>
 <h3>Exceptions à venir</h3>
 {availability_exceptions}
 <form method="post" action="/settings/availability/exception">
-  <label>Date
-  <input type="date" name="date" required>
-  </label>
-  <label>Minutes disponibles
-  <input type="number" name="available_min" value="120" min="0" max="720" required>
-  </label>
-  <label>Moment
-  <select name="time_of_day">{tod_options}</select>
-  </label>
-  <label>Contexte
-  <select name="context">{ctx_options}</select>
-  </label>
-  <label>Note
-  <input type="text" name="note" maxlength="300">
-  </label>
+  {exception_fields}
   <button type="submit">Ajouter ou remplacer l'exception</button>
 </form>
 </section>
@@ -265,18 +329,13 @@ document.querySelectorAll('.swatch').forEach(function(b) {{
 <div class="settings-group" id="sources">
 <div class="group-title" role="heading" aria-level="2">Sources d'activités</div>
 <section>
-<h2>Plugins d'activités</h2>
-<p class="hint">CyclAI fonctionne seul : l'import de fichiers .fit/.gpx (bouton du tableau de bord) est toujours disponible et passe en premier. Les autres sources (par exemple Garmin Connect) sont des plugins, désactivés tant que tu ne les actives pas. « Synchroniser » interroge les plugins activés dans l'ordre ci-dessous ; une activité qui chevauche une activité déjà enregistrée est ignorée, donc la source la mieux classée l'emporte.</p>
+<h2>Plugins d'activités</h2>{info_plugins}
 <form method="post" action="/settings/sources">
   <div class="source-row"><span><strong>1.</strong></span><span class="grow">Fichier .fit/.gpx <span class="badge">toujours actif</span></span></div>
 {source_rows}
 {no_plugins}
-  <label>Chevauchement toléré entre deux activités (secondes)
-  <input type="number" name="overlap_tolerance_s" value="{overlap_tolerance_s}" min="0" max="3600" step="1">
-  </label>
-  <p class="hint">Deux activités ne sont considérées comme superposées que si elles partagent plus de ce nombre de secondes (une sortie qui enchaîne directement sur la suivante ne compte pas).</p>
+  {overlap_field}
   <button type="submit">Enregistrer</button>
-  <p class="hint">Le nouvel ordre ne joue que pour les prochaines synchronisations : les activités déjà enregistrées ne changent pas. Pour réappliquer un ordre à tout l'historique, il faut le réimporter.</p>
 </form>
 </section>
 </div>
@@ -284,19 +343,15 @@ document.querySelectorAll('.swatch').forEach(function(b) {{
 <div class="settings-group" id="ia">
 <div class="group-title" role="heading" aria-level="2">Intelligence artificielle</div>
 <section>
-<h2>Clé API Anthropic</h2>
+<h2>Clé API Anthropic</h2>{info_key}
 <form method="post" action="/settings/keys">
-  <label>Clé API
-  <input type="password" autocomplete="off" name="anthropic_api_key" value="{anthropic_api_key}">
-  </label>
-  <p class="hint">Optionnelle : sans clé, les bilans/digests ne sont pas générés automatiquement, mais un « rapport IA » est téléchargeable depuis le dashboard et les pages d'activité pour le coller dans Claude, ChatGPT…</p>
+  {api_key_field}
   <button type="submit">Enregistrer</button>
 </form>
 </section>
 
 <section>
-<h2>Profil cycliste</h2>
-<p class="hint">Réinjecté dans chaque prompt envoyé au LLM (bilans et digest hebdomadaire) : FTP/zones, objectifs, équipement, contraintes...</p>
+<h2>Profil cycliste</h2>{info_cyclist}
 <form method="post" action="/settings/profile">
   <textarea class="settings-textarea" name="athlete_profile">{athlete_profile}</textarea>
   <button type="submit">Enregistrer</button>
@@ -304,8 +359,7 @@ document.querySelectorAll('.swatch').forEach(function(b) {{
 </section>
 
 <section>
-<h2>Prompt système — bilan d'activité</h2>
-<p class="hint">Envoyé au LLM à chaque génération/régénération du bilan d'une sortie.</p>
+<h2>Prompt système — bilan d'activité</h2>{info_bilan}
 <form method="post" action="/settings/prompts/bilan">
   <textarea class="settings-textarea" name="system_prompt">{bilan_system_prompt}</textarea>
   <button type="submit">Enregistrer</button>
@@ -313,8 +367,7 @@ document.querySelectorAll('.swatch').forEach(function(b) {{
 </section>
 
 <section>
-<h2>Prompt système — digest hebdomadaire</h2>
-<p class="hint">Envoyé au LLM à chaque génération du digest hebdomadaire (recommandation de séance).</p>
+<h2>Prompt système — digest hebdomadaire</h2>{info_digest}
 <form method="post" action="/settings/prompts/digest">
   <textarea class="settings-textarea" name="system_prompt">{digest_system_prompt}</textarea>
   <button type="submit">Enregistrer</button>
@@ -323,39 +376,25 @@ document.querySelectorAll('.swatch').forEach(function(b) {{
 </div>
 "##,
         error_html = error_html,
-        theme_color = escape_html(&settings.theme_color),
-        swatches = THEME_PRESETS
-            .iter()
-            .map(|(name, hex)| format!(
-                r#"<button type="button" class="swatch{}" data-color="{hex}" style="background:{hex}" title="{name}" aria-label="{name}"></button>"#,
-                if hex.eq_ignore_ascii_case(&settings.theme_color) { " selected" } else { "" }
-            ))
-            .collect::<String>(),
-        theme_modes = super::layout::MODES
-            .iter()
-            .map(|(v, l)| format!(r#"<option value="{v}"{}>{l}</option>"#, if *v == settings.theme_mode { " selected" } else { "" }))
-            .collect::<String>(),
-        ftp_label = super::annotate_acronyms("FTP"),
-        ftp_watts = ftp_watts,
-        hr_max = hr_max,
-        hr_rest = hr_rest,
-        lthr = lthr,
-        hr_tss_coef = hr_tss_coef,
+        appearance_fields = appearance_fields,
+        athlete_fields = athlete_fields,
+        rules_fields = rules_fields,
+        exception_fields = exception_fields,
+        overlap_field = overlap_field,
+        api_key_field = api_key_field,
+        info_appearance = info("La couleur d'accent colore la navigation, les boutons et les liens ; les couleurs des zones et des courbes (puissance, FC…) restent fixes pour rester lisibles d'un écran à l'autre."),
+        info_profile = info("Enregistrer la FTP recalcule rétroactivement le TSS, l'IF et les zones de tout votre historique. La FC max, la FC repos et la FC seuil recalculent le hrTSS des courses à pied."),
+        info_rules = info("Le serveur les applique aux séances proposées et aux simulations de charge : l'agent ne peut pas les contourner. Un jour est « intense » si son IF atteint le seuil ou si son TSS atteint le TSS minimum."),
+        info_availability = info("Temps dont vous disposez pour rouler, par jour de la semaine. L'agent s'en sert pour dimensionner les séances ; il peut poser des exceptions (vacances, soirées longues), mais jamais modifier ces règles. « Journée libre » : vous pouvez rouler en journée comme le soir ; sinon, seulement le matin ou seulement le soir."),
+        info_plugins = info("CyclAI fonctionne seul : l'import de fichiers .fit/.gpx (bouton du tableau de bord) est toujours disponible et passe en premier. Les autres sources (par exemple Garmin Connect) sont des plugins, désactivés tant que vous ne les activez pas. « Synchroniser » interroge les plugins activés dans l'ordre ci-dessous ; une activité qui chevauche une activité déjà enregistrée est ignorée, donc la source la mieux classée l'emporte. Le nouvel ordre ne joue que pour les prochaines synchronisations : pour l'appliquer à tout l'historique, il faut le réimporter."),
+        info_key = info("Optionnelle : sans clé, les bilans et digests ne sont pas générés automatiquement, mais un « rapport IA » est téléchargeable depuis le tableau de bord et les pages d'activité, à coller dans Claude, ChatGPT…"),
+        info_cyclist = info("Réinjecté dans chaque prompt envoyé au LLM (bilans et digest hebdomadaire) : FTP et zones, objectifs, équipement, contraintes…"),
+        info_bilan = info("Envoyé au LLM à chaque génération ou régénération du bilan d'une sortie."),
+        info_digest = info("Envoyé au LLM à chaque génération du digest hebdomadaire (recommandation de séance)."),
         availability_rows = availability_rows,
         availability_exceptions = availability_exceptions,
-        tod_options = select_options(&crate::availability::TIMES_OF_DAY, "soir"),
-        ctx_options = select_options(&crate::availability::CONTEXTS, "autre"),
-        max_ctl_ramp = rules.max_ctl_ramp_per_week,
-        min_tsb = rules.min_tsb,
-        intense_if = rules.intense_if,
-        intense_tss = rules.intense_tss,
-        max_consec = rules.max_consecutive_intense,
-        min_rest = rules.min_rest_days_per_week,
-        run_pace = run_pace,
         source_rows = source_rows,
         no_plugins = no_plugins,
-        overlap_tolerance_s = source_cfg.tolerance_s,
-        anthropic_api_key = escape_html(&settings.anthropic_api_key),
         athlete_profile = escape_html(&settings.athlete_profile),
         bilan_system_prompt = escape_html(&settings.bilan_system_prompt),
         digest_system_prompt = escape_html(&settings.digest_system_prompt),
@@ -391,6 +430,8 @@ pub struct AthleteConfigForm {
     hr_tss_coef: f64,
     #[serde(default)]
     run_pace: String,
+    #[serde(default)]
+    weight_kg: String,
 }
 
 fn default_hr_tss_coef() -> f64 {
@@ -405,7 +446,7 @@ pub async fn update_athlete_config(
     axum::extract::Form(form): axum::extract::Form<AthleteConfigForm>,
 ) -> Redirect {
     let _ = sqlx::query(
-        "UPDATE athlete_config SET ftp_watts = ?, hr_max = ?, hr_rest = ?, lthr = ?, hr_tss_coef = ?, run_threshold_pace_s = ?, updated_at = datetime('now') WHERE id = 1",
+        "UPDATE athlete_config SET ftp_watts = ?, hr_max = ?, hr_rest = ?, lthr = ?, hr_tss_coef = ?, run_threshold_pace_s = ?, weight_kg = ?, updated_at = datetime('now') WHERE id = 1",
     )
     .bind(form.ftp_watts)
     .bind(form.hr_max)
@@ -414,6 +455,8 @@ pub async fn update_athlete_config(
     .bind(if form.hr_tss_coef.is_finite() { form.hr_tss_coef.clamp(0.0, 10.0) } else { 1.0 })
     // Blank or unreadable = not set (0).
     .bind(crate::workout::parse_pace(&form.run_pace).filter(|p| *p > 0.0).map(|p| p.round() as i64).unwrap_or(0))
+    // Blank or unreadable = not set (0).
+    .bind(form.weight_kg.trim().replace(',', ".").parse::<f64>().ok().filter(|w| w.is_finite() && *w > 0.0).map(|w| w.clamp(30.0, 250.0)).unwrap_or(0.0))
     .execute(&state.pool)
     .await;
 
@@ -449,23 +492,67 @@ pub async fn update_rules(State(state): State<AppState>, axum::extract::Form(f):
     Redirect::to("/settings")
 }
 
-fn select_options(values: &[&str], selected: &str) -> String {
-    values
-        .iter()
-        .map(|v| format!(r#"<option value="{v}"{}>{v}</option>"#, if *v == selected { " selected" } else { "" }))
-        .collect()
+/// One settings row: label on the left, control on the right with its own
+/// hint right under it, so descriptions always line up with their field.
+fn field(id: &str, label: &str, control: &str, hint: &str) -> String {
+    let hint = if hint.is_empty() { String::new() } else { format!(r#"<p class="hint">{}</p>"#, escape_html(hint)) };
+    format!(r#"<div class="field"><label for="{id}">{label}</label><div class="control">{control}{hint}</div></div>"#)
 }
 
-/// Weekday defaults: fields `min_0`…`min_6`, `tod_0`…, `ctx_0`… (Monday = 0).
-/// Rows that don't validate keep their current value.
+/// "2 h 30", "2 h" or "45 min".
+fn format_hm(min: i64) -> String {
+    match (min / 60, min % 60) {
+        (0, m) => format!("{m} min"),
+        (h, 0) => format!("{h} h"),
+        (h, m) => format!("{h} h {m:02}"),
+    }
+}
+
+/// Duration (hours + minutes), "journée libre" checkbox and, when it is not
+/// ticked, a morning / evening choice. Field names end with `sfx`.
+fn avail_inputs(sfx: &str, minutes: i64, tod: &str) -> String {
+    let (h, m) = (minutes / 60, minutes % 60);
+    let sel = |v: &str| if tod == v || (v == "soir" && tod != "matin") { " selected" } else { "" };
+    format!(
+        r#"<div class="avail-ctl"><span class="avail-dur"><input type="number" id="h_{sfx}" name="h_{sfx}" value="{h}" min="0" max="12" aria-label="Heures"> h <input type="number" name="m_{sfx}" value="{m}" min="0" max="59" aria-label="Minutes"> min</span><label class="avail-free"><input type="checkbox" name="free_{sfx}" value="1"{checked}> Journée libre</label><span class="avail-tod"><select name="tod_{sfx}" aria-label="Créneau"><option value="matin"{m_sel}>Matin seulement</option><option value="soir"{s_sel}>Soir seulement</option></select></span></div>"#,
+        checked = if tod == "journee" { " checked" } else { "" },
+        m_sel = sel("matin"),
+        s_sel = sel("soir"),
+    )
+}
+
+/// Hours + minutes form values as minutes, `None` when neither was sent.
+fn parse_hm(h: Option<&str>, m: Option<&str>) -> Option<i64> {
+    if h.is_none() && m.is_none() {
+        return None;
+    }
+    let n = |v: Option<&str>| v.and_then(|x| x.trim().parse::<i64>().ok()).unwrap_or(0).max(0);
+    Some((n(h) * 60 + n(m)).min(crate::availability::MAX_MINUTES))
+}
+
+fn slot_time_of_day(free: bool, tod: Option<&str>) -> &'static str {
+    if free {
+        "journee"
+    } else if tod == Some("matin") {
+        "matin"
+    } else {
+        "soir"
+    }
+}
+
+/// Weekday defaults: fields `h_0`/`m_0`, `free_0`, `tod_0`… (Monday = 0). A
+/// day ticked "journée libre" is available all day; otherwise morning or
+/// evening only. The context stays what it was. Rows that don't validate keep
+/// their current value.
 pub async fn update_availability(State(state): State<AppState>, axum::extract::Form(fields): axum::extract::Form<Vec<(String, String)>>) -> Redirect {
     let get = |k: String| fields.iter().find(|(n, _)| *n == k).map(|(_, v)| v.as_str());
     let mut slots = crate::availability::defaults(&state.pool).await.unwrap_or_default();
     for (i, slot) in slots.iter_mut().enumerate() {
+        let Some(available_min) = parse_hm(get(format!("h_{i}")), get(format!("m_{i}"))) else { continue };
         let candidate = crate::availability::Slot {
-            available_min: get(format!("min_{i}")).and_then(|v| v.trim().parse().ok()).unwrap_or(slot.available_min),
-            time_of_day: get(format!("tod_{i}")).unwrap_or(&slot.time_of_day).to_string(),
-            context: get(format!("ctx_{i}")).unwrap_or(&slot.context).to_string(),
+            available_min,
+            time_of_day: slot_time_of_day(get(format!("free_{i}")).is_some(), get(format!("tod_{i}"))).to_string(),
+            context: slot.context.clone(),
         };
         if crate::availability::validate(&candidate).is_ok() {
             *slot = candidate;
@@ -478,15 +565,24 @@ pub async fn update_availability(State(state): State<AppState>, axum::extract::F
 #[derive(Deserialize)]
 pub struct AvailabilityExceptionForm {
     date: String,
-    available_min: i64,
-    time_of_day: String,
-    context: String,
+    #[serde(default)]
+    h_exc: String,
+    #[serde(default)]
+    m_exc: String,
+    #[serde(default)]
+    free_exc: Option<String>,
+    #[serde(default)]
+    tod_exc: String,
     #[serde(default)]
     note: String,
 }
 
 pub async fn add_availability_exception(State(state): State<AppState>, axum::extract::Form(f): axum::extract::Form<AvailabilityExceptionForm>) -> Redirect {
-    let slot = crate::availability::Slot { available_min: f.available_min, time_of_day: f.time_of_day, context: f.context };
+    let slot = crate::availability::Slot {
+        available_min: parse_hm(Some(&f.h_exc), Some(&f.m_exc)).unwrap_or(0),
+        time_of_day: slot_time_of_day(f.free_exc.is_some(), Some(&f.tod_exc)).to_string(),
+        context: "autre".to_string(),
+    };
     if let (Some(date), Ok(())) = (crate::planned::parse_date(&f.date), crate::availability::validate(&slot)) {
         let note: String = f.note.trim().chars().take(300).collect();
         let _ = crate::availability::set_exception(&state.pool, date, &slot, Some(note.as_str()).filter(|n| !n.is_empty())).await;
