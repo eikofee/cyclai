@@ -36,7 +36,7 @@ cyclai oauth set-refresh-days 90   # inactivité maximale avant ré-autorisation
 | Scope | Donne accès à |
 |---|---|
 | `cyclai:read` | tout ce qui lit ou simule |
-| `cyclai:propose` | `propose_session`, `set_availability`, `mark_session_skipped`, `log_checkin`, `set_coach_note` |
+| `cyclai:propose` | `propose_session`, `set_availability`, `mark_session_skipped`, `log_checkin`, `set_coach_note`, `set_activity_bilan`, `link_activity_to_session` |
 
 `tools/list` ne montre que les outils autorisés par les scopes du jeton.
 
@@ -54,6 +54,10 @@ cyclai oauth set-refresh-days 90   # inactivité maximale avant ré-autorisation
 | `get_availability` | read | Temps disponible jour par jour |
 | `get_ride_envelope` | read | Scénarios de sortie possibles un jour donné, faisabilité vs règles |
 | `project_load` | read | Simulation de charge et violations (n'écrit rien) |
+| `get_daily_briefing` | read | Point du jour en un appel : forme, sorties récentes, sorties sans bilan, séances manquées, calendrier, records de puissance, check-ins, note |
+| `get_power_bests` | read | Meilleures puissances 15 s – 60 min : fenêtre récente, fenêtre précédente, tout temps |
+| `set_activity_bilan` | propose | Écrit (ou remplace) le bilan d'une sortie, signé par `author` |
+| `link_activity_to_session` | propose | Rattache une sortie à une séance que le rapprochement automatique a ratée |
 | `propose_session` | propose | Propose une séance (`workout_id` ou `free_ride_budget`, avec jusqu'à 3 `alternatives`) ; statut `proposed` |
 | `set_availability` | propose | Exception de disponibilité (jour ou plage) |
 | `mark_session_skipped` | propose | Marque une séance à venir comme passée |
@@ -61,6 +65,18 @@ cyclai oauth set-refresh-days 90   # inactivité maximale avant ré-autorisation
 | `set_coach_note` | propose | Message affiché en haut du dashboard |
 
 Chaque outil appelle en interne la route `/api/v1` correspondante : mêmes validations, mêmes règles, mêmes limites que l'API REST (voir `API.md`).
+
+## Routine quotidienne pilotée par l'IA
+
+CyclAI ne planifie rien : c'est l'agent qui décide quand regarder. Exemple de consigne à programmer une fois par jour côté Claude (tâche planifiée, avec le connecteur CyclAI) :
+
+> 1. `get_daily_briefing`.
+> 2. Pour chaque sortie de `activities_without_bilan` : `get_activity`, puis `set_activity_bilan` (2-4 phrases, `author` = ton nom). Compare avec `planned.comparison` quand la sortie était prévue ; si elle ne l'était pas, dis-le.
+> 3. Pour chaque entrée de `missed_sessions` : si une sortie récente non prévue correspond (`planned_id` nul, jour proche), `link_activity_to_session` ; sinon `mark_session_skipped`.
+> 4. Évalue la forme (TSB, CTL, check-ins, tendance `power_bests`) et les séances à venir ; au besoin `propose_session`.
+> 5. Termine par `set_coach_note` : un message du jour court (1000 caractères max) : où en est la forme, ce qui est prévu, un conseil.
+
+Le bilan écrit par l'agent remplace celui du bouton « Générer le bilan » (et inversement) ; l'utilisateur garde la main : propositions à valider, règles dures appliquées côté serveur, aucune suppression.
 
 ## Erreurs
 

@@ -142,6 +142,10 @@ fn api_routes() -> Router<AppState> {
         .route("/api/v1/activities", get(api::activities))
         .route("/api/v1/activities/{id}", get(api::activity))
         .route("/api/v1/activities/{id}/streams", get(api::activity_streams))
+        .route("/api/v1/activities/{id}/bilan", axum::routing::put(api::activity_bilan_put))
+        .route("/api/v1/power-bests", get(api::power_bests))
+        .route("/api/v1/briefing", get(api::briefing))
+        .route("/api/v1/planned/{id}/link", post(api::planned_link))
         .route("/api/v1/workouts", get(api::workouts))
         .route("/api/v1/workouts/categories", get(api::workout_categories))
         .route("/api/v1/workouts/{id}", get(api::workout))
@@ -1332,22 +1336,28 @@ async fn coach_note_html(pool: &SqlitePool) -> String {
     let Some((message, author, updated_at)) = row else {
         return String::new();
     };
+    // "2026-11-18 08:00:00" -> "2026-11-18 08:00"
+    let when: String = updated_at.chars().take(16).collect();
     let meta = match author {
-        Some(a) => format!("{} · {}", escape_html(&a), escape_html(&updated_at)),
-        None => escape_html(&updated_at),
+        Some(a) => format!("{} · {}", escape_html(&a), escape_html(&when)),
+        None => escape_html(&when),
     };
     format!(
-        r#"<aside class="coach-note"><div>{}</div><div class="coach-note-meta">{meta}<form method="post" action="/coach-note/clear"><button type="submit" class="secondary" title="Masquer ce message">Effacer</button></form></div></aside>"#,
+        r#"<section class="coach-note"><blockquote><p>{}</p></blockquote><footer class="coach-note-meta"><span>{meta}</span><form method="post" action="/coach-note/clear"><button type="submit" class="secondary" title="Masquer ce message">Effacer</button></form></footer></section>"#,
         escape_html(&message).replace('\n', "<br>"),
     )
 }
 
 const COACH_NOTE_CSS: &str = r#"
-.coach-note { margin: 0 0 1rem; padding: .8rem 1rem; border-radius: 8px; border-left: 4px solid currentColor; background: rgba(127,127,127,.12); }
+.coach-note { position: relative; margin: 0 0 1.2rem; padding: 1.3rem 1.6rem 1rem 3.6rem; border-left: 4px solid var(--accent); background: linear-gradient(135deg, var(--accent-soft), var(--card-bg) 70%); }
+.coach-note::before { content: "\201C"; position: absolute; left: .9rem; top: .1rem; font-size: 4.2rem; line-height: 1; font-weight: 700; color: var(--accent); opacity: .55; }
+.coach-note blockquote { margin: 0; }
+.coach-note blockquote p { margin: 0; font-size: 1.08rem; line-height: 1.55; font-weight: 500; color: var(--text); }
 .proposed-event { border-style: dashed !important; }
-.coach-note-meta { display: flex; gap: .6rem; align-items: center; margin-top: .4rem; font-size: .8rem; opacity: .7; }
+.coach-note-meta { display: flex; justify-content: space-between; gap: .6rem; align-items: center; margin-top: .8rem; font-size: .82rem; color: var(--text-muted); }
 .coach-note-meta form { margin: 0; }
 .coach-note-meta button { padding: .1rem .5rem; font-size: .8rem; }
+@media (max-width: 600px) { .coach-note { padding: 1rem 1rem .8rem 2.6rem; } .coach-note::before { font-size: 3.2rem; left: .6rem; } .coach-note blockquote p { font-size: 1rem; } }
 "#;
 
 async fn sync_status() -> axum::Json<crate::sync::Progress> {

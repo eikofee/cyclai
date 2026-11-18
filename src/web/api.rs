@@ -221,6 +221,8 @@ pub(super) struct ActivitiesQuery {
     days: Option<i64>,
     /// `ride` or `run`; anything else (or absent) means both.
     sport: Option<String>,
+    /// `true` keeps only activities that have no bilan yet.
+    unreviewed: Option<bool>,
 }
 
 /// `GET /api/v1/activities?limit=10&days=28&sport=run` — latest activities,
@@ -234,8 +236,13 @@ pub(super) async fn activities(State(state): State<AppState>, Query(q): Query<Ac
         Some("run") => "AND sport_type IN ('Run', 'TrailRun')",
         _ => "",
     };
+    let review_filter = if q.unreviewed == Some(true) {
+        "AND NOT EXISTS (SELECT 1 FROM activity_bilans b WHERE b.activity_id = activities.id)"
+    } else {
+        ""
+    };
     let rows: Vec<ActivityRecord> = sqlx::query_as(&format!(
-        "SELECT {ACTIVITY_COLUMNS} FROM activities WHERE started_at >= ? {sport_filter} \
+        "SELECT {ACTIVITY_COLUMNS} FROM activities WHERE started_at >= ? {sport_filter} {review_filter} \
          ORDER BY started_at DESC LIMIT ?"
     ))
     .bind(since)
@@ -243,7 +250,31 @@ pub(super) async fn activities(State(state): State<AppState>, Query(q): Query<Ac
     .fetch_all(&state.pool)
     .await?;
     let coef = crate::metrics::get_hr_config(&state.pool).await?.tss_coef;
-    let items: Vec<Value> = rows.iter().map(|r| activity_json(r, coef)).collect();
+    // Ids are integers from our own table: safe to inline.
+    let ids = rows.iter().map(|r| r.id.to_string()).collect::<Vec<_>>().join(",");
+    let planned: std::collections::HashMap<i64, i64> = sqlx::query_as::<_, (i64, i64)>(&format!(
+        "SELECT activity_id, id FROM planned_workouts WHERE activity_id IN ({ids})"
+    ))
+    .fetch_all(&state.pool)
+    .await?
+    .into_iter()
+    .collect();
+    let reviewed: std::collections::HashSet<i64> = sqlx::query_scalar::<_, i64>(&format!(
+        "SELECT activity_id FROM activity_bilans WHERE activity_id IN ({ids})"
+    ))
+    .fetch_all(&state.pool)
+    .await?
+    .into_iter()
+    .collect();
+    let items: Vec<Value> = rows
+        .iter()
+        .map(|r| {
+            let mut v = activity_json(r, coef);
+            v["planned_id"] = json!(planned.get(&r.id));
+            v["has_bilan"] = json!(reviewed.contains(&r.id));
+            v
+        })
+        .collect();
     Ok(Json(json!({ "count": items.len(), "activities": items })))
 }
 
@@ -319,11 +350,15 @@ pub(super) async fn activity(State(state): State<AppState>, Path(id): Path<i64>)
             .collect(),
     );
 
-    let bilan: Option<String> = sqlx::query_scalar("SELECT text FROM activity_bilans WHERE activity_id = ?")
-        .bind(id)
-        .fetch_optional(&state.pool)
-        .await?;
-    out["bilan"] = json!(bilan);
+    let bilan: Option<(String, Option<String>, String)> =
+        sqlx::query_as("SELECT text, author, generated_at FROM activity_bilans WHERE activity_id = ?")
+            .bind(id)
+            .fetch_optional(&state.pool)
+            .await?;
+    out["bilan"] = json!(bilan.as_ref().map(|b| &b.0));
+    out["bilan_author"] = json!(bilan.as_ref().and_then(|b| b.1.as_ref()));
+    out["bilan_at"] = json!(bilan.as_ref().map(|b| &b.2));
+    out["planned"] = linked_planned(&state.pool, &row, &ath).await?;
     Ok(Json(out))
 }
 
@@ -1652,5 +1687,253 @@ pub(super) async fn activity_streams(
         "hr_bpm": round_all(&d.hr_bpm, 0),
         "cadence": round_all(&d.cadence, 0),
         "altitude_m": round_all(&d.altitude_m, 1),
+    })))
+}
+
+// ---------------------------------------------------------------------------
+// Agent-facing additions: bilan written by an external AI, plan <-> activity
+// link, power bests, one-call daily briefing
+// ---------------------------------------------------------------------------
+
+const BILAN_MAX_CHARS: usize = 1500;
+
+/// The planned session linked to an activity (reconciled or manually linked),
+/// with a plan-vs-actual comparison; `null` when the ride was not planned.
+async fn linked_planned(pool: &SqlitePool, a: &ActivityRecord, ath: &crate::workout::Athlete) -> Result<Value, ApiError> {
+    let id: Option<i64> = sqlx::query_scalar("SELECT id FROM planned_workouts WHERE activity_id = ? LIMIT 1")
+        .bind(a.id)
+        .fetch_optional(pool)
+        .await?;
+    let Some(planned) = (match id {
+        Some(id) => crate::planned::get(pool, id).await?,
+        None => None,
+    }) else {
+        return Ok(Value::Null);
+    };
+    let (minutes, tss) = planned.load_estimate(ath);
+    let planned_if = crate::rules::intensity_factor(minutes, tss);
+    let mut out = planned_json(&planned, ath);
+    out["comparison"] = json!({
+        "duration_min": { "planned": round(minutes, 0), "actual": round(a.duration_s as f64 / 60.0, 0) },
+        "tss": {
+            "planned": round(tss, 0),
+            "actual": a.tss.map(|v| round(v, 0)),
+            "delta_pct": a.tss.filter(|_| tss > 0.0).map(|v| round((v - tss) / tss * 100.0, 0)),
+        },
+        "intensity_factor": { "planned": planned_if.map(|v| round(v, 2)), "actual": a.intensity_factor.map(|v| round(v, 2)) },
+    });
+    Ok(out)
+}
+
+#[derive(Deserialize)]
+pub(super) struct BilanRequest {
+    text: String,
+    /// Shown as the review's author (e.g. the agent's name). Max 60 chars.
+    author: Option<String>,
+}
+
+/// `PUT /api/v1/activities/{id}/bilan` — an external agent writes (or replaces)
+/// the activity's review, i.e. what the "Générer le bilan" button would produce.
+pub(super) async fn activity_bilan_put(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    Json(req): Json<BilanRequest>,
+) -> ApiResult {
+    let text = req.text.trim();
+    if text.is_empty() || text.chars().count() > BILAN_MAX_CHARS {
+        return Err(ApiError(
+            StatusCode::BAD_REQUEST,
+            format!("`text` must be 1 to {BILAN_MAX_CHARS} characters"),
+        ));
+    }
+    let exists: Option<i64> = sqlx::query_scalar("SELECT id FROM activities WHERE id = ?")
+        .bind(id)
+        .fetch_optional(&state.pool)
+        .await?;
+    if exists.is_none() {
+        return Err(ApiError(StatusCode::NOT_FOUND, format!("activity {id} not found")));
+    }
+    let author = req
+        .author
+        .as_deref()
+        .map(str::trim)
+        .filter(|a| !a.is_empty())
+        .map(|a| a.chars().take(60).collect::<String>());
+    // One bilan per activity, like the in-app generation: replace.
+    let mut tx = state.pool.begin().await?;
+    sqlx::query("DELETE FROM activity_bilans WHERE activity_id = ?").bind(id).execute(&mut *tx).await?;
+    sqlx::query("INSERT INTO activity_bilans (activity_id, text, author) VALUES (?, ?, ?)")
+        .bind(id)
+        .bind(text)
+        .bind(&author)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok(Json(json!({ "activity_id": id, "bilan": text, "author": author })))
+}
+
+#[derive(Deserialize)]
+pub(super) struct LinkRequest {
+    activity_id: i64,
+}
+
+/// `POST /api/v1/planned/{id}/link` — attach an activity to a planned session
+/// the automatic same-day matching did not pair (ride done a day late, two
+/// rides that day…); the session becomes `done`. Both must be free.
+pub(super) async fn planned_link(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    Json(req): Json<LinkRequest>,
+) -> ApiResult {
+    let ath = current_athlete(&state.pool).await?;
+    let planned = crate::planned::get(&state.pool, id)
+        .await?
+        .ok_or_else(|| ApiError(StatusCode::NOT_FOUND, format!("planned session {id} not found")))?;
+    let activity_exists: Option<i64> = sqlx::query_scalar("SELECT id FROM activities WHERE id = ?")
+        .bind(req.activity_id)
+        .fetch_optional(&state.pool)
+        .await?;
+    if activity_exists.is_none() {
+        return Err(ApiError(StatusCode::NOT_FOUND, format!("activity {} not found", req.activity_id)));
+    }
+    let taken: Option<i64> = sqlx::query_scalar("SELECT id FROM planned_workouts WHERE activity_id = ?")
+        .bind(req.activity_id)
+        .fetch_optional(&state.pool)
+        .await?;
+    if let Some(other) = taken {
+        return Err(ApiError(
+            StatusCode::CONFLICT,
+            format!("activity {} is already linked to planned session {other}", req.activity_id),
+        ));
+    }
+    if !crate::planned::set_status(&state.pool, id, "done").await? {
+        return Err(ApiError(
+            StatusCode::CONFLICT,
+            format!("a session with status `{}` cannot be linked", planned.status),
+        ));
+    }
+    sqlx::query("UPDATE planned_workouts SET activity_id = ? WHERE id = ?")
+        .bind(req.activity_id)
+        .bind(id)
+        .execute(&state.pool)
+        .await?;
+    let updated = crate::planned::get(&state.pool, id)
+        .await?
+        .ok_or_else(|| ApiError(StatusCode::NOT_FOUND, format!("planned session {id} not found")))?;
+    Ok(Json(planned_json(&updated, &ath)))
+}
+
+#[derive(Deserialize)]
+pub(super) struct PowerBestsQuery {
+    days: Option<i64>,
+}
+
+/// `GET /api/v1/power-bests?days=42` — best average power per benchmark
+/// duration over the last `days`, the equally long window before it (trend)
+/// and all time, each with the activity and its share of FTP.
+pub(super) async fn power_bests(State(state): State<AppState>, Query(q): Query<PowerBestsQuery>) -> ApiResult {
+    let days = q.days.unwrap_or(42).clamp(7, 730);
+    let since = days_ago(days - 1);
+    let prior_since = days_ago(2 * days - 1);
+    let ftp: i64 = sqlx::query_scalar("SELECT ftp_watts FROM athlete_config WHERE id = 1")
+        .fetch_one(&state.pool)
+        .await?;
+    let rows: Vec<(i64, f64, i64, String)> = sqlx::query_as(
+        "SELECT b.key, b.value, b.activity_id, a.started_at FROM activity_bests b \
+         JOIN activities a ON a.id = b.activity_id WHERE b.kind = 'power'",
+    )
+    .fetch_all(&state.pool)
+    .await?;
+    type Best = (f64, i64, String);
+    #[derive(Default)]
+    struct Slot {
+        window: Option<Best>,
+        prior: Option<Best>,
+        all: Option<Best>,
+    }
+    let mut slots: std::collections::BTreeMap<i64, Slot> = Default::default();
+    let better = |cur: &Option<Best>, v: f64| cur.as_ref().is_none_or(|c| v > c.0);
+    for (key, value, activity_id, started_at) in rows {
+        let slot = slots.entry(key).or_default();
+        let best = (value, activity_id, started_at.clone());
+        if better(&slot.all, value) {
+            slot.all = Some(best.clone());
+        }
+        if started_at >= since {
+            if better(&slot.window, value) {
+                slot.window = Some(best);
+            }
+        } else if started_at >= prior_since && better(&slot.prior, value) {
+            slot.prior = Some(best);
+        }
+    }
+    let fmt = |b: &Option<Best>| {
+        b.as_ref().map(|(w, id, at)| {
+            json!({
+                "watts": round(*w, 0),
+                "pct_ftp": if ftp > 0 { json!(round(w / ftp as f64 * 100.0, 0)) } else { Value::Null },
+                "activity_id": id,
+                "date": at.get(..10),
+            })
+        })
+    };
+    let durations: Vec<Value> = slots
+        .iter()
+        .map(|(secs, s)| json!({ "duration_s": secs, "window": fmt(&s.window), "prior_window": fmt(&s.prior), "all_time": fmt(&s.all) }))
+        .collect();
+    Ok(Json(json!({ "days": days, "since": since, "ftp_w": ftp, "durations": durations })))
+}
+
+/// `GET /api/v1/briefing` — everything an agent needs for the daily review in
+/// one call: profile and form, last 14 days of load, last week's activities
+/// (with plan link and whether they have a bilan), activities still without a
+/// bilan, the calendar around today (missed / awaiting-validation sessions
+/// called out), recent power bests, check-ins, availability, current coach note.
+pub(super) async fn briefing(State(state): State<AppState>) -> ApiResult {
+    let today = chrono::Utc::now().date_naive();
+    crate::planned::reconcile(&state.pool, today).await?;
+    let s = || State(state.clone());
+    let day = |offset: i64| (today + chrono::Duration::days(offset)).to_string();
+    let profile = profile(s()).await?.0;
+    let load = load(s(), Query(LoadQuery { days: Some(14) })).await?.0;
+    let recent = activities(s(), Query(ActivitiesQuery { limit: Some(20), days: Some(7), sport: None, unreviewed: None }))
+        .await?
+        .0;
+    let unreviewed =
+        activities(s(), Query(ActivitiesQuery { limit: Some(10), days: Some(21), sport: None, unreviewed: Some(true) }))
+            .await?
+            .0;
+    let planned = planned_list(s(), Query(PlannedQuery { from: Some(day(-7)), to: Some(day(8)), sport: None })).await?.0;
+    let power = power_bests(s(), Query(PowerBestsQuery { days: Some(42) })).await?.0;
+    let checkins = checkins(s(), Query(CheckinsQuery { from: Some(day(-7)), to: None })).await?.0;
+    let availability = availability_get(s(), Query(AvailabilityQuery { from: None, to: Some(day(6)) })).await?.0;
+    let coach_note = coach_note_get(s()).await?.0;
+
+    let today_s = today.to_string();
+    let with_status = |pred: &dyn Fn(&str, &str) -> bool| -> Vec<Value> {
+        planned["planned"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|p| pred(p["date"].as_str().unwrap_or(""), p["status"].as_str().unwrap_or("")))
+            .cloned()
+            .collect()
+    };
+    // Past sessions the sync never matched to a ride: done late, or skipped without saying so.
+    let missed = with_status(&|d, st| d < today_s.as_str() && matches!(st, "planned" | "confirmed"));
+    let awaiting = with_status(&|_, st| st == "proposed");
+    Ok(Json(json!({
+        "today": today_s,
+        "profile": profile,
+        "load": load,
+        "recent_activities": recent["activities"],
+        "activities_without_bilan": unreviewed["activities"],
+        "planned": planned["planned"],
+        "missed_sessions": missed,
+        "proposals_awaiting_validation": awaiting,
+        "power_bests": power,
+        "checkins": checkins["checkins"],
+        "availability": availability["days"],
+        "coach_note": coach_note,
     })))
 }

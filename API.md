@@ -2,7 +2,7 @@
 
 API JSON sous `/api/v1`, servie par un processus dédié : `cyclai serve-api` (port 3001 par défaut). Le dashboard (`cyclai serve`) ne sert **pas** l'API ; voir [Authentification](#authentification).
 
-- Tout est en lecture seule, sauf la planification de séances (`POST` / `DELETE` sur `/planned`) et la note du coach (`PUT /coach-note`).
+- Tout est en lecture seule, sauf la planification de séances (`POST` / `DELETE` sur `/planned`), la note du coach (`PUT /coach-note`) et les écritures d'un agent (bilan d'une sortie, rattachement sortie ↔ séance : voir [Agent](#agent-et-routine-quotidienne)).
 - Réponses en JSON ; les erreurs ont la forme `{"error": "message"}` avec le code HTTP adapté (400, 401, 403, 404, 500).
 - Dates au format `YYYY-MM-DD` ; `started_at` en ISO 8601 UTC.
 - Unités : distances en km, durées en secondes (`duration_s`) ou minutes (`duration_min`), puissances en W, FC en bpm, dénivelé en m.
@@ -76,6 +76,10 @@ Exposition avec Tailscale : [`deploy/tailscale-serve.json`](deploy/tailscale-ser
 | GET | [`/api/v1/ride-envelope`](#get-apiv1ride-envelope) | Sorties possibles un jour donné, TSS typique et faisabilité |
 | GET | [`/api/v1/coach-note`](#coach-note) | Message affiché en haut du dashboard |
 | PUT | [`/api/v1/coach-note`](#coach-note) | Remplacer (ou effacer) ce message |
+| GET | [`/api/v1/briefing`](#agent-et-routine-quotidienne) | Tout pour le point du jour en un appel |
+| GET | [`/api/v1/power-bests`](#agent-et-routine-quotidienne) | Meilleures puissances par durée (fenêtre, fenêtre précédente, tout temps) |
+| PUT | [`/api/v1/activities/{id}/bilan`](#agent-et-routine-quotidienne) | Écrire / remplacer le bilan d'une sortie |
+| POST | [`/api/v1/planned/{id}/link`](#agent-et-routine-quotidienne) | Rattacher une sortie à une séance planifiée |
 | GET | [`/api/v1/planned`](#get-apiv1planned) | Séances planifiées |
 | POST | [`/api/v1/planned`](#post-apiv1planned) | Planifier une séance |
 | DELETE | [`/api/v1/planned/{id}`](#delete-apiv1plannedid) | Retirer une séance du calendrier |
@@ -361,6 +365,17 @@ Sommaire du catalogue :
 {"categories": [{"category": "Depuis Zwift", "groups": [
   {"group_key": "ftp-builder", "group_name": "FTP Builder", "count": 24}]}]}
 ```
+
+## Agent et routine quotidienne
+
+Ces routes permettent à un agent IA externe de piloter le point quotidien (CyclAI ne lance rien lui-même). Toutes sauf `GET` demandent une clé `write` (ou le scope MCP `cyclai:propose`).
+
+- `GET /api/v1/briefing` : rapproche d'abord les sorties des séances (comme `GET /planned`), puis renvoie en un appel `today`, `profile` (FTP, zones, forme), `load` (14 j), `recent_activities` (7 j, avec `planned_id` et `has_bilan`), `activities_without_bilan` (21 j), `planned` (de J-7 à J+7), `missed_sessions` (séances passées jamais rattachées à une sortie), `proposals_awaiting_validation`, `power_bests` (42 j), `checkins` (7 j), `availability` (7 j) et `coach_note`.
+- `GET /api/v1/power-bests?days=42` (7 à 730) : pour chaque durée de référence (15 s à 60 min), `window` (meilleure puissance moyenne sur les `days` derniers jours), `prior_window` (la fenêtre de même longueur juste avant, pour la tendance) et `all_time`, chacune avec `watts`, `pct_ftp`, `activity_id`, `date`.
+- `GET /api/v1/activities?unreviewed=true` ne garde que les sorties sans bilan ; chaque sortie des listes porte `planned_id` et `has_bilan`. `GET /activities/{id}` ajoute `bilan_author`, `bilan_at` et `planned` : la séance planifiée réalisée, avec `comparison` (durée, TSS, IF prévus vs réels), ou `null` si la sortie n'était pas prévue.
+- `PUT /api/v1/activities/{id}/bilan` avec `{"text": "...", "author": "coach"}` : écrit le bilan (1 à 1500 caractères, remplace l'existant, comme « Régénérer le bilan »). `author` est facultatif (60 car. max) ; `404` si la sortie n'existe pas.
+- `POST /api/v1/planned/{id}/link` avec `{"activity_id": 42}` : pour une séance que le rapprochement automatique (même jour, même sport) n'a pas appariée, par exemple faite avec un jour de retard. La séance (`planned`, `confirmed` ou `proposed`) passe à `done`. `409` si l'activité est déjà rattachée ou si le statut ne le permet pas. Rien ne se supprime.
+- Le message du jour (MotD) reste `PUT /api/v1/coach-note`.
 
 ## Coach note
 

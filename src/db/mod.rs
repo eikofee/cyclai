@@ -154,6 +154,7 @@ mod tests {
             sqlx::query(&format!("ALTER TABLE activities DROP COLUMN {col}")).execute(&pool).await.unwrap();
         }
         sqlx::query("ALTER TABLE athlete_config DROP COLUMN weight_kg").execute(&pool).await.unwrap();
+        sqlx::query("ALTER TABLE activity_bilans DROP COLUMN author").execute(&pool).await.unwrap();
         sqlx::query("DROP INDEX idx_planned_idempotency").execute(&pool).await.unwrap();
         for col in ["max_ctl_ramp_per_week", "min_tsb", "intense_if", "intense_tss", "max_consecutive_intense", "min_rest_days_per_week"] {
             sqlx::query(&format!("ALTER TABLE athlete_config DROP COLUMN {col}")).execute(&pool).await.unwrap();
@@ -187,7 +188,7 @@ mod tests {
 
         migrate(&pool).await.unwrap();
         let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM _sqlx_migrations").fetch_one(&pool).await.unwrap();
-        assert_eq!(n, 17); // initial (adopted) + the sixteen later migrations (applied after)
+        assert_eq!(n, 18); // initial (adopted) + the seventeen later migrations (applied after)
         migrate(&pool).await.unwrap(); // idempotent
     }
 

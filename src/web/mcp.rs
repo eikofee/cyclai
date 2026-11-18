@@ -117,16 +117,36 @@ fn tools() -> Vec<Tool> {
                     "limit": int("Max items, default 10, max 200."),
                     "days": int("Only the last N days."),
                     "sport": json!({ "type": "string", "enum": ["ride", "run"] }),
+                    "unreviewed": json!({ "type": "boolean", "description": "Only activities without a bilan (review) yet." }),
                 }),
                 &[],
             ),
         },
         Tool {
             name: "get_activity",
-            description: "One activity with laps, performance analysis, segment efforts and the generated review.",
+            description: "One activity with laps, performance analysis, segment efforts, the review (`bilan`, `bilan_author`) \
+                          and the planned session it fulfilled (`planned`, with a plan-vs-actual `comparison`; null if unplanned).",
             scope: SCOPE_READ,
             route: Route::Get("/api/v1/activities/{id}"),
             input: obj(json!({ "id": int("Activity id.") }), &["id"]),
+        },
+        Tool {
+            name: "get_power_bests",
+            description: "Best average power per duration (15 s to 60 min) over the last N days, the equally long window \
+                          before it (to see the trend) and all time, with % of FTP and the activity.",
+            scope: SCOPE_READ,
+            route: Route::Get("/api/v1/power-bests"),
+            input: obj(json!({ "days": int("Window in days, default 42, 7-730.") }), &[]),
+        },
+        Tool {
+            name: "get_daily_briefing",
+            description: "Everything for the daily review in ONE call: profile & form, 14 days of load, last week's \
+                          activities (planned_id, has_bilan), activities still without a bilan, calendar -7/+7 days \
+                          (missed_sessions = past sessions never matched to a ride), proposals awaiting validation, \
+                          power bests, check-ins, availability, current coach note.",
+            scope: SCOPE_READ,
+            route: Route::Get("/api/v1/briefing"),
+            input: obj(json!({}), &[]),
         },
         Tool {
             name: "search_workouts",
@@ -313,8 +333,28 @@ fn tools() -> Vec<Tool> {
             ),
         },
         Tool {
+            name: "set_activity_bilan",
+            description: "Write (or replace) the review of an activity, shown in its Bilan block. 2-4 sentences, plain text, \
+                          in the athlete's language; compare with the planned session when `get_activity` returns one.",
+            scope: SCOPE_PROPOSE,
+            route: Route::Put("/api/v1/activities/{id}/bilan"),
+            input: obj(
+                json!({ "id": int("Activity id."), "text": text("Max 1500 chars."), "author": text("Shown with the review. Max 60 chars.") }),
+                &["id", "text"],
+            ),
+        },
+        Tool {
+            name: "link_activity_to_session",
+            description: "Pair a completed activity with a planned/confirmed/proposed session the automatic same-day matching \
+                          missed (e.g. ride done a day late). The session becomes `done`. Both must be unlinked.",
+            scope: SCOPE_PROPOSE,
+            route: Route::Post("/api/v1/planned/{id}/link"),
+            input: obj(json!({ "id": int("Planned session id."), "activity_id": int("Activity id.") }), &["id", "activity_id"]),
+        },
+        Tool {
             name: "set_coach_note",
-            description: "Replace the short message shown at the top of the athlete's dashboard (empty = clear).",
+            description: "Replace the short message shown at the top of the athlete's dashboard (empty = clear). \
+                          This is the daily message of the day.",
             scope: SCOPE_PROPOSE,
             route: Route::Put("/api/v1/coach-note"),
             input: obj(json!({ "message": text("Max 1000 chars."), "author": text("Shown next to the message.") }), &["message"]),
@@ -862,6 +902,78 @@ mod tests {
         assert!(total >= 12 && errors >= 4, "{total} {errors}");
         let client: String = sqlx::query_scalar("SELECT client FROM mcp_audit LIMIT 1").fetch_one(&pool).await.unwrap();
         assert_eq!(client, "key:k");
+    }
+
+    #[tokio::test]
+    async fn mcp_agent_writes_bilans_links_sessions_and_reads_the_briefing() {
+        let (app, pool, token) = setup(Scope::Write).await;
+        let step = r#"{"type":"interval","duration":{"type":"time","value":"60min"},"target":{"type":"ftp_pct_range","low":65,"high":65}}"#;
+        let steps = format!(r#"{{"name":"Z2","steps":[{step}]}}"#);
+        let now = chrono::Utc::now();
+        let day = |back: i64| (now - chrono::Duration::days(back)).format("%Y-%m-%d").to_string();
+        for (id, back) in [(1, 5), (2, 2)] {
+            sqlx::query("INSERT INTO activities (id, started_at, duration_s, distance_m, elevation_gain_m, tss, intensity_factor, sport_type) VALUES (?, ?, 3600, 30000, 100, 60, 0.7, 'Ride')")
+                .bind(id)
+                .bind(format!("{}T08:00:00Z", day(back)))
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+        sqlx::query("INSERT INTO activity_bests (activity_id, kind, key, value) VALUES (1, 'power', 300, 250), (2, 'power', 300, 270)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        // Planned on the day of activity 1 (auto-matched) and a day before activity 2 (missed).
+        for back in [5, 3] {
+            sqlx::query("INSERT INTO planned_workouts (planned_date, name, steps_json) VALUES (?, 'Z2', ?)")
+                .bind(day(back))
+                .bind(&steps)
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+        crate::metrics::recompute_daily_load(&pool).await.unwrap();
+        let structured = |v: &Value| v["result"]["structuredContent"].clone();
+
+        // The briefing reconciles, then exposes what is left to do.
+        let (_, brief) = rpc(&app, Some(&token), call_tool(1, "get_daily_briefing", json!({}))).await;
+        assert_eq!(brief["result"]["isError"], false, "{brief}");
+        let b = structured(&brief);
+        assert_eq!(b["activities_without_bilan"].as_array().unwrap().len(), 2);
+        assert_eq!(b["missed_sessions"].as_array().unwrap().len(), 1, "{b}");
+        let missed_id = b["missed_sessions"][0]["id"].as_i64().unwrap();
+        let first = b["recent_activities"].as_array().unwrap().iter().find(|a| a["id"] == 1).unwrap();
+        assert!(first["planned_id"].is_i64() && first["has_bilan"] == false, "{first}");
+        assert_eq!(b["power_bests"]["durations"][0]["window"]["watts"], 270.0);
+
+        // Activity 1 carries its plan, compared with what was done.
+        let (_, act) = rpc(&app, Some(&token), call_tool(2, "get_activity", json!({ "id": 1 }))).await;
+        let a = structured(&act);
+        assert_eq!(a["planned"]["status"], "done", "{a}");
+        assert!(a["planned"]["comparison"]["tss"]["planned"].is_number());
+
+        // The agent writes the bilan; it replaces, shows its author, and leaves the "to review" list.
+        let (_, w) = rpc(&app, Some(&token), call_tool(3, "set_activity_bilan", json!({ "id": 1, "text": "Sortie conforme au plan.", "author": "coach" }))).await;
+        assert_eq!(w["result"]["isError"], false, "{w}");
+        rpc(&app, Some(&token), call_tool(4, "set_activity_bilan", json!({ "id": 1, "text": "Conforme, un peu plus dur." }))).await;
+        let (_, act) = rpc(&app, Some(&token), call_tool(5, "get_activity", json!({ "id": 1 }))).await;
+        assert_eq!(structured(&act)["bilan"], "Conforme, un peu plus dur.");
+        assert!(structured(&act)["bilan_author"].is_null());
+        let (_, todo) = rpc(&app, Some(&token), call_tool(6, "list_activities", json!({ "unreviewed": true }))).await;
+        assert_eq!(structured(&todo)["count"], 1);
+        let (_, bad) = rpc(&app, Some(&token), call_tool(7, "set_activity_bilan", json!({ "id": 999, "text": "x" }))).await;
+        assert_eq!(structured(&bad)["code"], "not_found");
+        let (_, empty) = rpc(&app, Some(&token), call_tool(8, "set_activity_bilan", json!({ "id": 1, "text": "  " }))).await;
+        assert_eq!(structured(&empty)["code"], "invalid_argument");
+
+        // Link the late ride to the missed session; a linked activity cannot be reused.
+        let (_, l) = rpc(&app, Some(&token), call_tool(9, "link_activity_to_session", json!({ "id": missed_id, "activity_id": 2 }))).await;
+        assert_eq!(structured(&l)["status"], "done", "{l}");
+        assert_eq!(structured(&l)["activity_id"], 2);
+        let (_, again) = rpc(&app, Some(&token), call_tool(10, "link_activity_to_session", json!({ "id": missed_id, "activity_id": 1 }))).await;
+        assert_eq!(structured(&again)["code"], "conflict");
+        let (_, brief) = rpc(&app, Some(&token), call_tool(11, "get_daily_briefing", json!({}))).await;
+        assert!(structured(&brief)["missed_sessions"].as_array().unwrap().is_empty());
     }
 
     #[tokio::test]
